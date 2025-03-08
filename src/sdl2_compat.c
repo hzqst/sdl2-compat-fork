@@ -58,7 +58,7 @@ This breaks the build when creating SDL_ ## DisableScreenSaver
  * The number might increment past 90 if there are a ton of releases.
  */
 #define SDL2_COMPAT_VERSION_MINOR 32
-#define SDL2_COMPAT_VERSION_PATCH 51
+#define SDL2_COMPAT_VERSION_PATCH 53
 
 #ifndef SDL2COMPAT_REVISION
 #define SDL2COMPAT_REVISION "SDL-2." STRINGIFY(SDL2_COMPAT_VERSION_MINOR) "." STRINGIFY(SDL2_COMPAT_VERSION_PATCH) "-no-vcs"
@@ -100,7 +100,7 @@ This breaks the build when creating SDL_ ## DisableScreenSaver
 #include <unistd.h> /* for readlink() */
 #endif
 
-#if defined(__unix__) || defined(__APPLE__)
+#if defined(SDL_PLATFORM_UNIX) || defined(__APPLE__)
 #ifndef PATH_MAX
 #define PATH_MAX 1024
 #endif
@@ -208,7 +208,15 @@ do { \
 #include <SDL3/SDL_opengl_glext.h>
 
 /* !!! FIXME: collect all the properties in one place near the top of the source file */
-#define PROP_WINDOW_FILTERED_FIRST_RESIZE "sdl2-compat.window.filtered_first_resize"
+#define PROP_WINDOW_EXPECTED_WIDTH "sdl2-compat.window.expected_width"
+#define PROP_WINDOW_EXPECTED_HEIGHT "sdl2-compat.window.expected_height"
+#define PROP_WINDOW_EXPECTED_SCALE "sdl2-compat.window.expected_scale"
+#define PROP_RENDERER_BATCHING "sdl2-compat.renderer.batching"
+#define PROP_RENDERER_RELATIVE_SCALING "sdl2-compat.renderer.relative-scaling"
+#define PROP_RENDERER_INTEGER_SCALE "sdl2-compat.renderer.integer_scale"
+#define PROP_SURFACE2 "sdl2-compat.surface2"
+#define PROP_STREAM2 "sdl2-compat.stream2"
+
 
 
 static bool WantDebugLogging = false;
@@ -251,7 +259,7 @@ SDL2COMPAT_itoa(char *dst, int val)
 /* you can use SDL3_strlen once we're past startup. */
 static int SDL2Compat_strlen(const char *str)
 {
-    int retval = 0;
+    volatile int retval = 0;  /* volatile prevents gcc from optimizing this into strlen() */
     while (str[retval]) {
         retval++;
     }
@@ -272,6 +280,19 @@ static bool SDL2Compat_strequal(const char *a, const char *b)
         b++;
     }
     return true;
+}
+
+/* you can use SDL3_strrchr once we're past startup. */
+static char *SDL2Compat_strrchr(const char *string, int c)
+{
+    const char *bufp = string + SDL2Compat_strlen(string);
+    while (bufp >= string) {
+        if (*bufp == c) {
+            return (char *)bufp;
+        }
+        --bufp;
+    }
+    return NULL;
 }
 
 /* log a string using platform-specific code for before SDL3 is fully available. */
@@ -386,7 +407,7 @@ static char loaderror[256];
 
         return false; /* didn't find it anywhere reasonable. :( */
     }
-#elif defined(__unix__)
+#elif defined(SDL_PLATFORM_UNIX)
     #include <dlfcn.h>
     #define SDL3_LIBNAME "libSDL3.so.0"
     static void *Loaded_SDL3 = NULL;
@@ -398,7 +419,7 @@ static char loaderror[256];
 #endif
 
 #ifndef SDL3_REQUIRED_VER
-#define SDL3_REQUIRED_VER SDL_VERSIONNUM(3,2,4)
+#define SDL3_REQUIRED_VER SDL_VERSIONNUM(3,2,6)
 #endif
 
 #ifndef DIRSEP
@@ -441,24 +462,85 @@ typedef struct QuirkEntryType
 
 static QuirkEntryType quirks[] = {
     /* TODO: Add any quirks needed for various systems. */
-    /*{"my_game_name", "SDL_RENDER_BATCHING", "0"},*/
-    {"", "", "0"} /* A dummy entry to keep compilers happy. */
+    /*{ "my_game_name", "SDL_RENDER_BATCHING", "0" },*/
+
+#ifdef SDL_PLATFORM_WIN32
+    /* Half-Life handles WM_MOUSEMOVE when raw input is disabled */
+    { "hl.exe", SDL_HINT_MOUSE_EMULATE_WARP_WITH_RELATIVE, "0" },
+#endif
+
+    /* Moonlight supports high DPI properly under Wayland */
+    { "moonlight", SDL_HINT_VIDEO_WAYLAND_SCALE_TO_DISPLAY, "0" },
+    { "moonlight-qt", SDL_HINT_VIDEO_WAYLAND_SCALE_TO_DISPLAY, "0" },
+
+    /* Tauon Music Box supports high DPI properly under Wayland.
+     * It also pumps events off the main thread, which causes crashes in libdecor.
+     * It draws its own window border, so we don't actually need window decorations.
+     */
+    { "tauon/__main__.py", SDL_HINT_VIDEO_WAYLAND_SCALE_TO_DISPLAY, "0" },
+    { "tauon/__main__.py", SDL_HINT_VIDEO_WAYLAND_ALLOW_LIBDECOR, "0" },
+
+    /* Stylus Labs Write does its own X11 input handling */
+    { "Write", "SDL_VIDEO_X11_XINPUT2", "0" },
 };
 
 #ifdef __linux__
-static void OS_GetExeName(char *buf, const unsigned maxpath) {
+static void OS_GetExeName(char *buf, const unsigned maxpath, bool *use_base_path)
+{
     int ret;
     buf[0] = '\0';
     ret = readlink("/proc/self/exe", buf, maxpath);
     (void)ret;
+    if (strstr(buf, "/python")) {
+        /* Get the name of the script Python is running */
+        FILE *fp = fopen("/proc/self/cmdline", "r");
+        if (fp) {
+            char tmp[SDL2COMPAT_MAXPATH];
+            size_t len = fread(tmp, 1, sizeof(tmp) - 1, fp);
+            if (len > 0) {
+                char *spot = tmp, *end = tmp + len;
+                if (strstr(tmp, "python")) {
+                    /* Skip the name of the interpreter */
+                    while (spot < end) {
+                        if (*spot == '\0') {
+                            ++spot;
+                            break;
+                        }
+                        ++spot;
+                    }
+                }
+                if (spot < end) {
+                    /* Get the name of the script, including the directory containing it
+                     * e.g. /app/bin/src/tauon/__main__.py -> tauon/__main__.py
+                     */
+                    char *sep = strrchr(spot, '/');
+                    if (sep) {
+                        while (sep > spot) {
+                            --sep;
+                            if (*sep == '/') {
+                                ++sep;
+                                break;
+                            }
+                        }
+                        spot = sep;
+                    }
+                    snprintf(buf, maxpath, "%s", spot);
+                }
+                *use_base_path = false;
+            }
+            fclose(fp);
+        }
+    }
 }
 #elif defined(_WIN32)
-static void OS_GetExeName(char *buf, const unsigned maxpath) {
+static void OS_GetExeName(char *buf, const unsigned maxpath, bool *use_base_path)
+{
     buf[0] = '\0';
     GetModuleFileNameA(NULL, buf, maxpath);
 }
 #elif defined(__APPLE__) || defined(SDL_PLATFORM_FREEBSD)
-static void OS_GetExeName(char *buf, const unsigned maxpath) {
+static void OS_GetExeName(char *buf, const unsigned maxpath, bool *use_base_path)
+{
     const char *progname = getprogname();
     if (progname != NULL) {
         strlcpy(buf, progname, maxpath);
@@ -468,7 +550,8 @@ static void OS_GetExeName(char *buf, const unsigned maxpath) {
 }
 #else
 #warning Please implement this for your platform.
-static void OS_GetExeName(char *buf, const unsigned maxpath) {
+static void OS_GetExeName(char *buf, const unsigned maxpath, bool *use_base_path)
+{
     buf[0] = '\0';
     (void)maxpath;
 }
@@ -481,9 +564,10 @@ SDL2Compat_GetExeName(void)
     if (exename == NULL) {
         static char path_buf[SDL2COMPAT_MAXPATH];
         static char *base_path;
-        OS_GetExeName(path_buf, SDL2COMPAT_MAXPATH);
-        base_path = SDL3_strrchr(path_buf, *DIRSEP);
-        if (base_path) {
+        bool use_base_path = true;
+        OS_GetExeName(path_buf, SDL2COMPAT_MAXPATH, &use_base_path);
+        base_path = SDL2Compat_strrchr(path_buf, *DIRSEP);
+        if (base_path && use_base_path) {
             /* We have a '\\' component. */
             exename = base_path + 1;
         } else {
@@ -493,25 +577,6 @@ SDL2Compat_GetExeName(void)
     }
     return exename;
 }
-
-static const char *
-SDL2Compat_GetHint(const char *name)
-{
-    return SDL3_getenv(name);
-}
-
-static bool
-SDL2Compat_GetHintBoolean(const char *name, bool default_value)
-{
-    const char *val = SDL2Compat_GetHint(name);
-
-    if (!val) {
-        return default_value;
-    }
-
-    return (SDL3_atoi(val) != 0);
-}
-
 
 static struct {
     const char *old_hint;
@@ -536,6 +601,9 @@ static struct {
     { "SDL_VIDEO_X11_WMCLASS", "SDL_APP_ID" },
     { "SDL_VIDEO_GL_DRIVER", "SDL_OPENGL_LIBRARY" },
     { "SDL_VIDEO_EGL_DRIVER", "SDL_EGL_LIBRARY" },
+
+    /* This value is inverted in SDL2_to_SDL3_hint_value() */
+    { "SDL_WINDOWS_NO_CLOSE_ON_ALT_F4", "SDL_WINDOWS_CLOSE_ON_ALT_F4" },
 };
 
 static const char *SDL2_to_SDL3_hint(const char *name)
@@ -552,23 +620,29 @@ static const char *SDL2_to_SDL3_hint(const char *name)
 
 static const char *SDL2_to_SDL3_hint_value(const char *name, const char *value, bool *free_value)
 {
-    if (name && value && SDL3_strcmp(name, SDL_HINT_LOGGING) == 0) {
-        /* Rewrite numeric priorities for SDL3 */
-        char *value3 = SDL3_strdup(value);
-        if (value3) {
-            char *sep;
-            for (sep = SDL3_strchr(value3, '='); sep; sep = SDL3_strchr(sep + 1, '=')) {
-                if (SDL3_isdigit(sep[1]) && sep[1] != '0') {
-                    sep[1] = '0' + SDL3_atoi(&sep[1]) + 1;
+    *free_value = false;
+
+    if (name && value && *value) {
+        if (SDL3_strcmp(name, SDL_HINT_LOGGING) == 0) {
+            /* Rewrite numeric priorities for SDL3 */
+            char *value3 = SDL3_strdup(value);
+            if (value3) {
+                char *sep;
+                for (sep = SDL3_strchr(value3, '='); sep; sep = SDL3_strchr(sep + 1, '=')) {
+                    if (SDL3_isdigit(sep[1]) && sep[1] != '0') {
+                        sep[1] = '0' + SDL3_atoi(&sep[1]) + 1;
+                    }
                 }
             }
+            *free_value = true;
+            return value3;
+        } else if (SDL3_strcmp(name, "SDL_WINDOWS_NO_CLOSE_ON_ALT_F4") == 0) {
+            /* Invert the boolean value for SDL3 */
+            return (*value == '0' || SDL3_strcasecmp(value, "false") == 0) ? "1" : "0";
         }
-        *free_value = true;
-        return value3;
-    } else {
-        *free_value = false;
-        return value;
     }
+
+    return value;
 }
 
 SDL_DECLSPEC SDL2_bool SDLCALL
@@ -733,7 +807,7 @@ SDL2Compat_ApplyQuirks(bool force_x11)
 }
 
 
-/* DO NOT CALL THINGS THAT USE SDL ALLOCATORS HERE. It runs before main(), so app-supplied allocators are not set at this point.
+/* DO NOT USE SDL3 FUNCTIONS IN HERE! It runs before main(), so app-supplied allocators are not set at this point.
    This means no SDL_Log, no hint subsystem, nothing that might call SDL_SetError! In fact, favor code in this file, using
    platform-specific #ifdefs, to calling into SDL3 at all, if you can help it. */
 static int
@@ -765,8 +839,8 @@ LoadSDL3(void)
         if (!okay) {
             SDL2COMPAT_stpcpy(loaderror, "Failed loading SDL3 library.");
         } else {
-            #define SDL3_SYM(rc,fn,params,args,ret) SDL3_##fn = (SDL3_##fn##_t) LoadSDL3Symbol("SDL_" #fn, &okay);
-            #include "sdl3_syms.h"
+            /* Load SDL_GetVersion() alone first to allow us to check and log the required SDL3 version */
+            SDL3_GetVersion = (SDL3_GetVersion_t) LoadSDL3Symbol("SDL_GetVersion", &okay);
             if (okay) {
                 char sdl3verstr[16];
                 char sdl3reqverstr[16];
@@ -822,6 +896,8 @@ LoadSDL3(void)
                     SDL2Compat_ApplyQuirks(force_x11);  /* Apply and maybe print a list of any enabled quirks. */
                 }
             }
+            #define SDL3_SYM(rc,fn,params,args,ret) SDL3_##fn = (SDL3_##fn##_t) LoadSDL3Symbol("SDL_" #fn, &okay);
+            #include "sdl3_syms.h"
             if (!okay) {
                 UnloadSDL3();
             }
@@ -951,17 +1027,26 @@ BOOL WINAPI _DllMainCRTStartup(HANDLE dllhandle, DWORD reason, LPVOID reserved)
 
 /* !!! FIXME: unify coding convention on the globals: some are MyVariableName and some are my_variable_name */
 static int timer_init = 0;
-static SDL2_Surface *OldWindowSurfaces[16];
 static SDL2_EventFilter EventFilter2 = NULL;
 static void *EventFilterUserData2 = NULL;
 static SDL_mutex *EventWatchListMutex = NULL;
 static SDL2_LogOutputFunction LogOutputFunction2 = NULL;
 static EventFilterWrapperData *EventWatchers2 = NULL;
 static SDL2_bool relative_mouse_mode = SDL2_FALSE;
+static float relative_mouse_state_x_frac = 0.0f;
+static float relative_mouse_state_y_frac = 0.0f;
+static float relative_mouse_event_x_frac = 0.0f;
+static float relative_mouse_event_y_frac = 0.0f;
+static float mouse_wheel_event_x_frac = 0.0f;
+static float mouse_wheel_event_y_frac = 0.0f;
+static SDL_JoystickID *joystick_instance_list = NULL;
+static int num_joystick_instances = 0;
 static SDL_JoystickID *joystick_list = NULL;
 static int num_joysticks = 0;
 static SDL_JoystickID *gamepad_button_swap_list = NULL;
 static int num_gamepad_button_swap_list = 0;
+static SDL_SensorID *sensor_instance_list = NULL;
+static int num_sensor_instances = 0;
 static SDL_SensorID *sensor_list = NULL;
 static int num_sensors = 0;
 static SDL_HapticID *haptic_list = NULL;
@@ -998,12 +1083,32 @@ static int NumTouchFingers = 0;
 
 static SDL_PropertiesID timers = 0;
 
+static SDL_JoystickID JoystickID2to3(SDL2_JoystickID id);
+static SDL2_JoystickID JoystickID3to2(SDL_JoystickID id);
+static SDL_SensorID SensorID2to3(SDL2_SensorID id);
+static SDL2_SensorID SensorID3to2(SDL_SensorID id);
+
 /* Functions! */
 
 static SDL_InitState InitSDL2CompatGlobals;
 
+/**
+ * Verbosity of logged events as defined in SDL_HINT_EVENT_LOGGING:
+ *  - 0: (default) no logging
+ *  - 1: logging of most events
+ *  - 2: as above, plus mouse and finger motion
+ *  - 3: as above, plus SDL_SysWMEvents
+ */
+static int SDL2_EventLoggingVerbosity = 0;
+
+static void SDLCALL SDL2_EventLoggingChanged(void *userdata, const char *name, const char *oldValue, const char *hint)
+{
+    SDL2_EventLoggingVerbosity = (hint && *hint) ? SDL_clamp(SDL_atoi(hint), 0, 3) : 0;
+}
+
 static void SDL2Compat_QuitInternal(void)
 {
+    SDL3_RemoveHintCallback("SDL2_EVENT_LOGGING", SDL2_EventLoggingChanged, NULL);
     if (EventWatchListMutex) {
         SDL3_DestroyMutex(EventWatchListMutex);
         EventWatchListMutex = NULL;
@@ -1070,6 +1175,15 @@ SDL2Compat_InitOnStartupInternal(void)
     SDL3_SetHint("SDL_WINDOWS_DPI_AWARENESS", "unaware");
     SDL3_SetHint("SDL_BORDERLESS_WINDOWED_STYLE", "0");
     SDL3_SetHint("SDL_VIDEO_SYNC_WINDOW_OPERATIONS", "1");
+    SDL3_SetHint("SDL_VIDEO_X11_EXTERNAL_WINDOW_INPUT", "0");
+
+    // Pretend Wayland doesn't have fractional scaling by default.
+    // This is more compatible with applications that have only been tested under X11 without high DPI support.
+    // For apps that support high DPI on Wayland, add a SDL_HINT_VIDEO_WAYLAND_SCALE_TO_DISPLAY=0 quirk for them.
+    // Full discussion is here: https://github.com/libsdl-org/SDL/issues/12158
+    SDL3_SetHint(SDL_HINT_VIDEO_WAYLAND_SCALE_TO_DISPLAY, "1");
+
+    SDL3_AddHintCallback("SDL2_EVENT_LOGGING", SDL2_EventLoggingChanged, NULL);
 
     SDL2Compat_InitLogPrefixes();
 
@@ -1132,23 +1246,12 @@ SDL_GetErrorMsg(char *errstr, int maxlen)
 SDL_DECLSPEC int SDLCALL
 SDL_SetError(const char *fmt, ...)
 {
-    char ch;
-    char *str = NULL;
-    size_t len = 0;
     va_list ap;
 
     va_start(ap, fmt);
-    len = SDL3_vsnprintf(&ch, 1, fmt, ap);
+    SDL3_SetErrorV(fmt, ap);
     va_end(ap);
 
-    str = (char *) SDL3_malloc(len + 1);
-    if (str) {
-        va_start(ap, fmt);
-        SDL3_vsnprintf(str, len + 1, fmt, ap);
-        va_end(ap);
-        SDL3_SetError("%s", str);
-        SDL3_free(str);
-    }
     return -1;
 }
 
@@ -1359,6 +1462,385 @@ SDL_DECLSPEC void SDLCALL SDL_LogGetOutputFunction(SDL2_LogOutputFunction *callb
     }
 }
 
+static void LogEvent2(const SDL2_Event *event)
+{
+    char name[64];
+    char details[128];
+
+    /* sensor/mouse/finger motion are spammy, ignore these if they aren't demanded. */
+    if ((SDL2_EventLoggingVerbosity < 2) &&
+        ((event->type == SDL_EVENT_MOUSE_MOTION) ||
+         (event->type == SDL_EVENT_FINGER_MOTION) ||
+         (event->type == SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION) ||
+         (event->type == SDL_EVENT_GAMEPAD_SENSOR_UPDATE) ||
+         (event->type == SDL_EVENT_SENSOR_UPDATE))) {
+        return;
+    }
+
+    /* window manager events are even more spammy, and don't provide much useful info. */
+    if ((SDL2_EventLoggingVerbosity < 3) && (event->type == SDL2_SYSWMEVENT)) {
+        return;
+    }
+
+    /* ignore these top level events since we'll handle the SDL2 versions only */
+    if ((event->type >= SDL_EVENT_DISPLAY_FIRST && event->type <= SDL_EVENT_DISPLAY_LAST) ||
+        (event->type >= SDL_EVENT_WINDOW_FIRST && event->type <= SDL_EVENT_WINDOW_LAST)) {
+        return;
+    }
+
+/* this is to make (void)SDL3_snprintf() calls cleaner. */
+#define uint unsigned int
+
+    name[0] = '\0';
+    details[0] = '\0';
+
+    /* !!! FIXME: This code is kinda ugly, sorry. */
+
+    if ((event->type >= SDL_EVENT_USER) && (event->type <= SDL_EVENT_LAST)) {
+        char plusstr[16];
+        SDL_strlcpy(name, "SDL_USEREVENT", sizeof(name));
+        if (event->type > SDL_EVENT_USER) {
+            (void)SDL3_snprintf(plusstr, sizeof(plusstr), "+%u", ((uint)event->type) - SDL_EVENT_USER);
+        } else {
+            plusstr[0] = '\0';
+        }
+        (void)SDL3_snprintf(details, sizeof(details), "%s (timestamp=%u windowid=%u code=%d data1=%p data2=%p)",
+                            plusstr, (uint)event->user.timestamp, (uint)event->user.windowID,
+                            (int)event->user.code, event->user.data1, event->user.data2);
+    }
+
+    switch (event->type) {
+#define SDL_EVENT_CASE(name2, name3) \
+    case name3:                      \
+        SDL_strlcpy(name, #name2, sizeof(name));
+        SDL_EVENT_CASE(SDL_QUIT, SDL_EVENT_QUIT)
+        (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u)", (uint)event->quit.timestamp);
+        break;
+        SDL_EVENT_CASE(SDL_APP_TERMINATING, SDL_EVENT_TERMINATING)
+        break;
+        SDL_EVENT_CASE(SDL_APP_LOWMEMORY, SDL_EVENT_LOW_MEMORY)
+        break;
+        SDL_EVENT_CASE(SDL_APP_WILLENTERBACKGROUND, SDL_EVENT_WILL_ENTER_BACKGROUND)
+        break;
+        SDL_EVENT_CASE(SDL_APP_DIDENTERBACKGROUND, SDL_EVENT_DID_ENTER_BACKGROUND)
+        break;
+        SDL_EVENT_CASE(SDL_APP_WILLENTERFOREGROUND, SDL_EVENT_WILL_ENTER_FOREGROUND)
+        break;
+        SDL_EVENT_CASE(SDL_APP_DIDENTERFOREGROUND, SDL_EVENT_DID_ENTER_FOREGROUND)
+        break;
+        SDL_EVENT_CASE(SDL_LOCALECHANGED, SDL_EVENT_LOCALE_CHANGED)
+        break;
+        SDL_EVENT_CASE(SDL_KEYMAPCHANGED, SDL_EVENT_KEYMAP_CHANGED)
+        break;
+        SDL_EVENT_CASE(SDL_CLIPBOARDUPDATE, SDL_EVENT_CLIPBOARD_UPDATE)
+        break;
+        SDL_EVENT_CASE(SDL_RENDER_TARGETS_RESET, SDL_EVENT_RENDER_TARGETS_RESET)
+        break;
+        SDL_EVENT_CASE(SDL_RENDER_DEVICE_RESET, SDL_EVENT_RENDER_DEVICE_RESET)
+        break;
+
+        SDL_EVENT_CASE(SDL_DISPLAYEVENT, SDL2_DISPLAYEVENT)
+        {
+            char dname[64];
+            switch (event->display.event) {
+#define SDL_DISPLAYEVENT_CASE(name2, name3)        \
+    case name3 - 0x150:                            \
+        SDL_strlcpy(dname, #name2, sizeof(dname)); \
+        break
+                SDL_DISPLAYEVENT_CASE(SDL_DISPLAYEVENT_ORIENTATION, SDL_EVENT_DISPLAY_ORIENTATION);
+                SDL_DISPLAYEVENT_CASE(SDL_DISPLAYEVENT_CONNECTED, SDL_EVENT_DISPLAY_ADDED);
+                SDL_DISPLAYEVENT_CASE(SDL_DISPLAYEVENT_DISCONNECTED, SDL_EVENT_DISPLAY_REMOVED);
+                SDL_DISPLAYEVENT_CASE(SDL_DISPLAYEVENT_MOVED, SDL_EVENT_DISPLAY_MOVED);
+#undef SDL_DISPLAYEVENT_CASE
+            default:
+                SDL_strlcpy(dname, "UNKNOWN (bug? fixme?)", sizeof(dname));
+                break;
+            }
+            (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u display=%u event=%s data1=%d)",
+                                (uint)event->display.timestamp, (uint)event->display.display, dname, (int)event->display.data1);
+            break;
+        }
+
+
+        SDL_EVENT_CASE(SDL_WINDOWEVENT, SDL2_WINDOWEVENT)
+        {
+            char wname[64];
+            switch (event->window.event) {
+#define SDL_WINDOWEVENT_CASE(name2)                \
+    case name2:                                    \
+        SDL_strlcpy(wname, #name2, sizeof(wname)); \
+        break
+                SDL_WINDOWEVENT_CASE(SDL_WINDOWEVENT_SHOWN);
+                SDL_WINDOWEVENT_CASE(SDL_WINDOWEVENT_HIDDEN);
+                SDL_WINDOWEVENT_CASE(SDL_WINDOWEVENT_EXPOSED);
+                SDL_WINDOWEVENT_CASE(SDL_WINDOWEVENT_MOVED);
+                SDL_WINDOWEVENT_CASE(SDL_WINDOWEVENT_RESIZED);
+                SDL_WINDOWEVENT_CASE(SDL_WINDOWEVENT_SIZE_CHANGED);
+                SDL_WINDOWEVENT_CASE(SDL_WINDOWEVENT_MINIMIZED);
+                SDL_WINDOWEVENT_CASE(SDL_WINDOWEVENT_MAXIMIZED);
+                SDL_WINDOWEVENT_CASE(SDL_WINDOWEVENT_RESTORED);
+                SDL_WINDOWEVENT_CASE(SDL_WINDOWEVENT_ENTER);
+                SDL_WINDOWEVENT_CASE(SDL_WINDOWEVENT_LEAVE);
+                SDL_WINDOWEVENT_CASE(SDL_WINDOWEVENT_FOCUS_GAINED);
+                SDL_WINDOWEVENT_CASE(SDL_WINDOWEVENT_FOCUS_LOST);
+                SDL_WINDOWEVENT_CASE(SDL_WINDOWEVENT_CLOSE);
+                //SDL_WINDOWEVENT_CASE(SDL_WINDOWEVENT_TAKE_FOCUS);
+                SDL_WINDOWEVENT_CASE(SDL_WINDOWEVENT_HIT_TEST);
+                SDL_WINDOWEVENT_CASE(SDL_WINDOWEVENT_ICCPROF_CHANGED);
+                SDL_WINDOWEVENT_CASE(SDL_WINDOWEVENT_DISPLAY_CHANGED);
+#undef SDL_WINDOWEVENT_CASE
+            default:
+                SDL_strlcpy(wname, "UNKNOWN (bug? fixme?)", sizeof(wname));
+                break;
+            }
+            (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u windowid=%u event=%s data1=%d data2=%d)",
+                                (uint)event->window.timestamp, (uint)event->window.windowID, wname, (int)event->window.data1, (int)event->window.data2);
+            break;
+        }
+
+        SDL_EVENT_CASE(SDL_SYSWMEVENT, SDL2_SYSWMEVENT)
+        /* !!! FIXME: we don't delve further at the moment. */
+        (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u)", (uint)event->syswm.timestamp);
+        break;
+
+#define PRINT_KEY_EVENT(event)                                                                                                    \
+    (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u windowid=%u state=%s repeat=%s scancode=%u keycode=%u mod=%u)", \
+                        (uint)event->key.timestamp, (uint)event->key.windowID,                                                    \
+                        event->key.state != 0 ? "pressed" : "released",                                                           \
+                        event->key.repeat ? "true" : "false",                                                                     \
+                        (uint)event->key.keysym.scancode,                                                                         \
+                        (uint)event->key.keysym.sym,                                                                              \
+                        (uint)event->key.keysym.mod)
+        SDL_EVENT_CASE(SDL_KEYDOWN, SDL_EVENT_KEY_DOWN)
+        PRINT_KEY_EVENT(event);
+        break;
+        SDL_EVENT_CASE(SDL_KEYUP, SDL_EVENT_KEY_UP)
+        PRINT_KEY_EVENT(event);
+        break;
+#undef PRINT_KEY_EVENT
+
+        SDL_EVENT_CASE(SDL_TEXTEDITING, SDL_EVENT_TEXT_EDITING)
+        (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u windowid=%u text='%s' start=%d length=%d)",
+                            (uint)event->edit.timestamp, (uint)event->edit.windowID,
+                            event->edit.text, (int)event->edit.start, (int)event->edit.length);
+        break;
+
+        SDL_EVENT_CASE(SDL_TEXTINPUT, SDL_EVENT_TEXT_INPUT)
+        (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u windowid=%u text='%s')", (uint)event->text.timestamp, (uint)event->text.windowID, event->text.text);
+        break;
+
+        SDL_EVENT_CASE(SDL_MOUSEMOTION, SDL_EVENT_MOUSE_MOTION)
+        (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u windowid=%u which=%u state=%u x=%d y=%d xrel=%d yrel=%d)",
+                            (uint)event->motion.timestamp, (uint)event->motion.windowID,
+                            (uint)event->motion.which, (uint)event->motion.state,
+                            (int)event->motion.x, (int)event->motion.y,
+                            (int)event->motion.xrel, (int)event->motion.yrel);
+        break;
+
+#define PRINT_MBUTTON_EVENT(event)                                                                                               \
+    (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u windowid=%u which=%u button=%u state=%s clicks=%u x=%d y=%d)", \
+                        (uint)event->button.timestamp, (uint)event->button.windowID,                                             \
+                        (uint)event->button.which, (uint)event->button.button,                                                   \
+                        event->button.state != 0 ? "pressed" : "released",                                                       \
+                        (uint)event->button.clicks, (int)event->button.x, (int)event->button.y)
+        SDL_EVENT_CASE(SDL_MOUSEBUTTONDOWN, SDL_EVENT_MOUSE_BUTTON_DOWN)
+        PRINT_MBUTTON_EVENT(event);
+        break;
+        SDL_EVENT_CASE(SDL_MOUSEBUTTONUP, SDL_EVENT_MOUSE_BUTTON_UP)
+        PRINT_MBUTTON_EVENT(event);
+        break;
+#undef PRINT_MBUTTON_EVENT
+
+        SDL_EVENT_CASE(SDL_MOUSEWHEEL, SDL_EVENT_MOUSE_WHEEL)
+        (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u windowid=%u which=%u x=%d y=%d preciseX=%f preciseY=%f direction=%s)",
+                            (uint)event->wheel.timestamp, (uint)event->wheel.windowID,
+                            (uint)event->wheel.which, (int)event->wheel.x, (int)event->wheel.y,
+                            event->wheel.preciseX, event->wheel.preciseY,
+                            event->wheel.direction == SDL_MOUSEWHEEL_NORMAL ? "normal" : "flipped");
+        break;
+
+        SDL_EVENT_CASE(SDL_JOYAXISMOTION, SDL_EVENT_JOYSTICK_AXIS_MOTION)
+        (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u which=%d axis=%u value=%d)",
+                            (uint)event->jaxis.timestamp, (int)event->jaxis.which,
+                            (uint)event->jaxis.axis, (int)event->jaxis.value);
+        break;
+
+        SDL_EVENT_CASE(SDL_JOYBALLMOTION, SDL_EVENT_JOYSTICK_BALL_MOTION)
+        (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u which=%d ball=%u xrel=%d yrel=%d)",
+                            (uint)event->jball.timestamp, (int)event->jball.which,
+                            (uint)event->jball.ball, (int)event->jball.xrel, (int)event->jball.yrel);
+        break;
+
+        SDL_EVENT_CASE(SDL_JOYHATMOTION, SDL_EVENT_JOYSTICK_HAT_MOTION)
+        (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u which=%d hat=%u value=%u)",
+                            (uint)event->jhat.timestamp, (int)event->jhat.which,
+                            (uint)event->jhat.hat, (uint)event->jhat.value);
+        break;
+
+#define PRINT_JBUTTON_EVENT(event)                                                               \
+    (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u which=%d button=%u state=%s)", \
+                        (uint)event->jbutton.timestamp, (int)event->jbutton.which,               \
+                        (uint)event->jbutton.button, event->jbutton.state != 0 ? "pressed" : "released")
+        SDL_EVENT_CASE(SDL_JOYBUTTONDOWN, SDL_EVENT_JOYSTICK_BUTTON_DOWN)
+        PRINT_JBUTTON_EVENT(event);
+        break;
+        SDL_EVENT_CASE(SDL_JOYBUTTONUP, SDL_EVENT_JOYSTICK_BUTTON_UP)
+        PRINT_JBUTTON_EVENT(event);
+        break;
+#undef PRINT_JBUTTON_EVENT
+
+#define PRINT_JOYDEV_EVENT(event) (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u which=%d)", (uint)event->jdevice.timestamp, (int)event->jdevice.which)
+        SDL_EVENT_CASE(SDL_JOYDEVICEADDED, SDL_EVENT_JOYSTICK_ADDED)
+        PRINT_JOYDEV_EVENT(event);
+        break;
+        SDL_EVENT_CASE(SDL_JOYDEVICEREMOVED, SDL_EVENT_JOYSTICK_REMOVED)
+        PRINT_JOYDEV_EVENT(event);
+        break;
+#undef PRINT_JOYDEV_EVENT
+
+        SDL_EVENT_CASE(SDL_CONTROLLERAXISMOTION, SDL_EVENT_GAMEPAD_AXIS_MOTION)
+        (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u which=%d axis=%u value=%d)",
+                            (uint)event->caxis.timestamp, (int)event->caxis.which,
+                            (uint)event->caxis.axis, (int)event->caxis.value);
+        break;
+
+#define PRINT_CBUTTON_EVENT(event)                                                               \
+    (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u which=%d button=%u state=%s)", \
+                        (uint)event->cbutton.timestamp, (int)event->cbutton.which,               \
+                        (uint)event->cbutton.button, event->cbutton.state != 0 ? "pressed" : "released")
+        SDL_EVENT_CASE(SDL_CONTROLLERBUTTONDOWN, SDL_EVENT_GAMEPAD_BUTTON_DOWN)
+        PRINT_CBUTTON_EVENT(event);
+        break;
+        SDL_EVENT_CASE(SDL_CONTROLLERBUTTONUP, SDL_EVENT_GAMEPAD_BUTTON_UP)
+        PRINT_CBUTTON_EVENT(event);
+        break;
+#undef PRINT_CBUTTON_EVENT
+
+#define PRINT_CONTROLLERDEV_EVENT(event) (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u which=%d)", (uint)event->cdevice.timestamp, (int)event->cdevice.which)
+        SDL_EVENT_CASE(SDL_CONTROLLERDEVICEADDED, SDL_EVENT_GAMEPAD_ADDED)
+        PRINT_CONTROLLERDEV_EVENT(event);
+        break;
+        SDL_EVENT_CASE(SDL_CONTROLLERDEVICEREMOVED, SDL_EVENT_GAMEPAD_REMOVED)
+        PRINT_CONTROLLERDEV_EVENT(event);
+        break;
+        SDL_EVENT_CASE(SDL_CONTROLLERDEVICEREMAPPED, SDL_EVENT_GAMEPAD_REMAPPED)
+        PRINT_CONTROLLERDEV_EVENT(event);
+        break;
+        SDL_EVENT_CASE(SDL_CONTROLLERSTEAMHANDLEUPDATED, SDL_EVENT_GAMEPAD_STEAM_HANDLE_UPDATED)
+        PRINT_CONTROLLERDEV_EVENT(event);
+        break;
+#undef PRINT_CONTROLLERDEV_EVENT
+
+#define PRINT_CTOUCHPAD_EVENT(event)                                                                                      \
+    (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u which=%d touchpad=%d finger=%d x=%f y=%f pressure=%f)", \
+                        (uint)event->ctouchpad.timestamp, (int)event->ctouchpad.which,                                    \
+                        (int)event->ctouchpad.touchpad, (int)event->ctouchpad.finger,                                     \
+                        event->ctouchpad.x, event->ctouchpad.y, event->ctouchpad.pressure)
+        SDL_EVENT_CASE(SDL_CONTROLLERTOUCHPADDOWN, SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN)
+        PRINT_CTOUCHPAD_EVENT(event);
+        break;
+        SDL_EVENT_CASE(SDL_CONTROLLERTOUCHPADUP, SDL_EVENT_GAMEPAD_TOUCHPAD_UP)
+        PRINT_CTOUCHPAD_EVENT(event);
+        break;
+        SDL_EVENT_CASE(SDL_CONTROLLERTOUCHPADMOTION, SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION)
+        PRINT_CTOUCHPAD_EVENT(event);
+        break;
+#undef PRINT_CTOUCHPAD_EVENT
+
+        SDL_EVENT_CASE(SDL_CONTROLLERSENSORUPDATE, SDL_EVENT_GAMEPAD_SENSOR_UPDATE)
+        (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u which=%d sensor=%d data[0]=%f data[1]=%f data[2]=%f)",
+                            (uint)event->csensor.timestamp, (int)event->csensor.which, (int)event->csensor.sensor,
+                            event->csensor.data[0], event->csensor.data[1], event->csensor.data[2]);
+        break;
+
+#define PRINT_FINGER_EVENT(event)                                                                                                                       \
+    (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u touchid=%" SDL_PRIs64 " fingerid=%" SDL_PRIs64 " x=%f y=%f dx=%f dy=%f pressure=%f)", \
+                        (uint)event->tfinger.timestamp, event->tfinger.touchId,                                                                         \
+                        event->tfinger.fingerId, event->tfinger.x, event->tfinger.y,                                                                    \
+                        event->tfinger.dx, event->tfinger.dy, event->tfinger.pressure)
+        SDL_EVENT_CASE(SDL_FINGERDOWN, SDL_EVENT_FINGER_DOWN)
+        PRINT_FINGER_EVENT(event);
+        break;
+        SDL_EVENT_CASE(SDL_FINGERUP, SDL_EVENT_FINGER_UP)
+        PRINT_FINGER_EVENT(event);
+        break;
+        SDL_EVENT_CASE(SDL_FINGERMOTION, SDL_EVENT_FINGER_MOTION)
+        PRINT_FINGER_EVENT(event);
+        break;
+#undef PRINT_FINGER_EVENT
+
+#define PRINT_DOLLAR_EVENT(event)                                                                                                                       \
+    (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u touchid=%" SDL_PRIs64 " gestureid=%" SDL_PRIs64 " numfingers=%u error=%f x=%f y=%f)", \
+                        (uint)event->dgesture.timestamp, event->dgesture.touchId,                                                                       \
+                        event->dgesture.gestureId, (uint)event->dgesture.numFingers,                                                                    \
+                        event->dgesture.error, event->dgesture.x, event->dgesture.y)
+        SDL_EVENT_CASE(SDL_DOLLARGESTURE, SDL_DOLLARGESTURE)
+        PRINT_DOLLAR_EVENT(event);
+        break;
+        SDL_EVENT_CASE(SDL_DOLLARRECORD, SDL_DOLLARRECORD)
+        PRINT_DOLLAR_EVENT(event);
+        break;
+#undef PRINT_DOLLAR_EVENT
+
+        SDL_EVENT_CASE(SDL_MULTIGESTURE, SDL_MULTIGESTURE)
+        (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u touchid=%" SDL_PRIs64 " dtheta=%f ddist=%f x=%f y=%f numfingers=%u)",
+                            (uint)event->mgesture.timestamp, event->mgesture.touchId,
+                            event->mgesture.dTheta, event->mgesture.dDist,
+                            event->mgesture.x, event->mgesture.y, (uint)event->mgesture.numFingers);
+        break;
+
+#define PRINT_DROP_EVENT(event) (void)SDL3_snprintf(details, sizeof(details), " (file='%s' timestamp=%u windowid=%u)", event->drop.file, (uint)event->drop.timestamp, (uint)event->drop.windowID)
+        SDL_EVENT_CASE(SDL_DROPFILE, SDL_EVENT_DROP_FILE)
+        PRINT_DROP_EVENT(event);
+        break;
+        SDL_EVENT_CASE(SDL_DROPTEXT, SDL_EVENT_DROP_TEXT)
+        PRINT_DROP_EVENT(event);
+        break;
+        SDL_EVENT_CASE(SDL_DROPBEGIN, SDL_EVENT_DROP_BEGIN)
+        PRINT_DROP_EVENT(event);
+        break;
+        SDL_EVENT_CASE(SDL_DROPCOMPLETE, SDL_EVENT_DROP_COMPLETE)
+        PRINT_DROP_EVENT(event);
+        break;
+#undef PRINT_DROP_EVENT
+
+#define PRINT_AUDIODEV_EVENT(event) (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u which=%u iscapture=%s)", (uint)event->adevice.timestamp, (uint)event->adevice.which, event->adevice.iscapture ? "true" : "false")
+        SDL_EVENT_CASE(SDL_AUDIODEVICEADDED, SDL_EVENT_AUDIO_DEVICE_ADDED)
+        PRINT_AUDIODEV_EVENT(event);
+        break;
+        SDL_EVENT_CASE(SDL_AUDIODEVICEREMOVED, SDL_EVENT_AUDIO_DEVICE_REMOVED)
+        PRINT_AUDIODEV_EVENT(event);
+        break;
+#undef PRINT_AUDIODEV_EVENT
+
+        SDL_EVENT_CASE(SDL_SENSORUPDATE, SDL_EVENT_SENSOR_UPDATE)
+        (void)SDL3_snprintf(details, sizeof(details), " (timestamp=%u which=%d data[0]=%f data[1]=%f data[2]=%f data[3]=%f data[4]=%f data[5]=%f)",
+                            (uint)event->sensor.timestamp, (int)event->sensor.which,
+                            event->sensor.data[0], event->sensor.data[1], event->sensor.data[2],
+                            event->sensor.data[3], event->sensor.data[4], event->sensor.data[5]);
+        break;
+
+#undef SDL_EVENT_CASE
+
+    case SDL_EVENT_POLL_SENTINEL:
+        /* No logging necessary for this one */
+        break;
+
+    default:
+        if (!name[0]) {
+            SDL_strlcpy(name, "UNKNOWN", sizeof(name));
+            (void)SDL3_snprintf(details, sizeof(details), " #%u! (Bug? FIXME?)", (uint)event->type);
+        }
+        break;
+    }
+
+    if (name[0]) {
+        SDL_Log("SDL2 EVENT: %s%s", name, details);
+    }
+
+#undef uint
+}
+
 static void UpdateGamepadButtonSwap(SDL_Gamepad *gamepad)
 {
     int i;
@@ -1511,6 +1993,56 @@ static SDL_Keycode SDL3KeycodeToSDL2Keycode(SDL_Scancode scancode, SDL_Keycode k
     return SDL_SCANCODE_TO_KEYCODE(scancode);
 }
 
+static int GetIndexFromAudioDeviceInstance(SDL_AudioDeviceID devid, bool recording)
+{
+    AudioDeviceList *list = recording ? &AudioSDL3RecordingDevices : &AudioSDL3PlaybackDevices;
+    int i;
+
+    for (i = 0; i < list->num_devices; i++) {
+        if (devid == list->devices[i].devid) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static SDL_AudioDeviceID AudioDeviceID3to2(SDL_AudioDeviceID id)
+{
+    int i;
+
+    /* SDL2 only reserved IDs for open devices. Devices that aren't
+     * open will appear as ID 0 in SDL_EVENT_AUDIO_DEVICE_REMOVED. */
+    for (i = 0; i < (int)SDL_arraysize(AudioOpenDevices); i++) {
+        SDL2_AudioStream *stream = AudioOpenDevices[i];
+        if (!stream) {
+            continue;
+        }
+
+        if (SDL3_GetAudioStreamDevice(stream->stream3) == id) {
+            return i + 1;
+        }
+    }
+
+    return 0;
+}
+
+static int AccumulateFloatValueToInteger(float *frac, float value)
+{
+    float intval;
+
+    /* Reset the accumulated fractional value if the sign changes */
+    if ((*frac < 0.0f && value > 0.0f) || (*frac > 0.0f && value < 0.0f)) {
+        *frac = 0.0f;
+    }
+
+    /* Accumulate the fractional portion that is truncated by integer conversion */
+    *frac += value;
+    *frac = SDL3_modff(*frac, &intval);
+
+    return (int)intval;
+}
+
 /* (current) strategy for SDL_Events:
    in sdl12-compat, we built our own event queue, so when the SDL2 queue is pumped, we
    took the events we cared about and added them to the sdl12-compat queue, and otherwise
@@ -1528,17 +2060,10 @@ static SDL_Keycode SDL3KeycodeToSDL2Keycode(SDL_Scancode scancode, SDL_Keycode k
 
 static int GetIndexFromJoystickInstance(SDL_JoystickID jid);
 
-static SDL2_Event *
-Event3to2(const SDL_Event *event3, SDL2_Event *event2)
+static SDL2_Event *Event3to2(const SDL_Event *event3, SDL2_Event *event2)
 {
     SDL_Renderer *renderer;
     SDL_Event cvtevent3;
-
-#if 0
-    if (event3->type == SDL_SYSWMEVENT) {
-        return SDL2_FALSE;  /* !!! FIXME: figure out what to do with this. */
-    }
-#endif
 
     /* currently everything _mostly_ matches up between SDL2 and SDL3, but this might
        drift more as SDL3 development continues. */
@@ -1583,6 +2108,13 @@ Event3to2(const SDL_Event *event3, SDL2_Event *event2)
     case SDL_EVENT_DROP_COMPLETE:
         event2->drop.windowID = event3->drop.windowID;
         break;
+    case SDL_EVENT_WINDOW_MOUSE_ENTER:
+        /* Reset accumulated fractional mouse data when mouse focus changes */
+        relative_mouse_event_x_frac = 0.0f;
+        relative_mouse_event_y_frac = 0.0f;
+        mouse_wheel_event_x_frac = 0.0f;
+        mouse_wheel_event_y_frac = 0.0f;
+        break;
     case SDL_EVENT_MOUSE_MOTION:
         renderer = SDL3_GetRenderer(SDL3_GetWindowFromID(event3->motion.windowID));
         if (renderer) {
@@ -1591,6 +2123,11 @@ Event3to2(const SDL_Event *event3, SDL2_Event *event2)
             if (mode != SDL_LOGICAL_PRESENTATION_DISABLED) {
                 SDL3_memcpy(&cvtevent3, event3, sizeof (SDL_Event));
                 SDL3_ConvertEventToRenderCoordinates(renderer, &cvtevent3);
+                if (!SDL3_GetBooleanProperty(SDL3_GetRendererProperties(renderer), PROP_RENDERER_RELATIVE_SCALING, true)) {
+                    /* Undo the relative scaling that SDL_ConvertEventToRenderCoordinates() performed */
+                    cvtevent3.motion.xrel = event3->motion.xrel;
+                    cvtevent3.motion.yrel = event3->motion.yrel;
+                }
                 event3 = &cvtevent3;
             }
         }
@@ -1599,14 +2136,14 @@ Event3to2(const SDL_Event *event3, SDL2_Event *event2)
             motion->state = (Uint8)event3->motion.state;
             motion->x = (Sint32)event3->motion.x;
             motion->y = (Sint32)event3->motion.y;
-            motion->xrel = (Sint32)event3->motion.xrel;
-            motion->yrel = (Sint32)event3->motion.yrel;
+            motion->xrel = AccumulateFloatValueToInteger(&relative_mouse_event_x_frac, event3->motion.xrel);
+            motion->yrel = AccumulateFloatValueToInteger(&relative_mouse_event_y_frac, event3->motion.yrel);
         } else {
             SDL2_MouseMotionEvent *motion = &event2->motion;
             motion->x = (Sint32)event3->motion.x;
             motion->y = (Sint32)event3->motion.y;
-            motion->xrel = (Sint32)event3->motion.xrel;
-            motion->yrel = (Sint32)event3->motion.yrel;
+            motion->xrel = AccumulateFloatValueToInteger(&relative_mouse_event_x_frac, event3->motion.xrel);
+            motion->yrel = AccumulateFloatValueToInteger(&relative_mouse_event_y_frac, event3->motion.yrel);
         }
         break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
@@ -1652,35 +2189,35 @@ Event3to2(const SDL_Event *event3, SDL2_Event *event2)
             wheel->y = (Sint32)(event3->wheel.x * 120);
         } else {
             SDL2_MouseWheelEvent *wheel = &event2->wheel;
-            wheel->x = (Sint32)event3->wheel.x;
-            wheel->y = (Sint32)event3->wheel.y;
+            wheel->x = AccumulateFloatValueToInteger(&mouse_wheel_event_x_frac, event3->wheel.x);
+            wheel->y = AccumulateFloatValueToInteger(&mouse_wheel_event_y_frac, event3->wheel.y);
             wheel->preciseX = event3->wheel.x;
             wheel->preciseY = event3->wheel.y;
             wheel->mouseX = (Sint32)event3->wheel.mouse_x;
             wheel->mouseY = (Sint32)event3->wheel.mouse_y;
         }
         break;
-    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-    case SDL_EVENT_GAMEPAD_BUTTON_UP:
-        if (ShouldSwapGamepadButtons(event2->cbutton.which)) {
-            event2->cbutton.button = SwapGamepadButton(event2->cbutton.button);
-        }
+    case SDL_EVENT_JOYSTICK_AXIS_MOTION:
+        event2->jaxis.which = JoystickID3to2(event3->jaxis.which);
         break;
-    /* sensor timestamps are in nanosecond in SDL3 */
-    case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
-        event2->csensor.timestamp_us = SDL_NS_TO_US(event3->gsensor.sensor_timestamp);
+    case SDL_EVENT_JOYSTICK_BALL_MOTION:
+        event2->jball.which = JoystickID3to2(event3->jball.which);
         break;
-    case SDL_EVENT_SENSOR_UPDATE:
-        event2->sensor.timestamp_us = SDL_NS_TO_US(event3->sensor.sensor_timestamp);
+    case SDL_EVENT_JOYSTICK_HAT_MOTION:
+        event2->jhat.which = JoystickID3to2(event3->jhat.which);
         break;
-    /* Change SDL3 InstanceID to index */
+    case SDL_EVENT_JOYSTICK_BUTTON_DOWN:
+    case SDL_EVENT_JOYSTICK_BUTTON_UP:
+        event2->jbutton.which = JoystickID3to2(event3->jbutton.which);
+        break;
     case SDL_EVENT_JOYSTICK_ADDED:
         event2->jdevice.which = GetIndexFromJoystickInstance(event3->jdevice.which);
         break;
-    case SDL_EVENT_GAMEPAD_ADDED:
-        event2->cdevice.which = GetIndexFromJoystickInstance(event3->gdevice.which);
+    case SDL_EVENT_JOYSTICK_REMOVED:
+        event2->jdevice.which = JoystickID3to2(event3->jdevice.which);
         break;
     case SDL_EVENT_JOYSTICK_BATTERY_UPDATED:
+        event2->jbattery.which = JoystickID3to2(event3->jbattery.which);
         switch (event3->jbattery.state) {
         case SDL_POWERSTATE_CHARGING:
         case SDL_POWERSTATE_CHARGED:
@@ -1702,21 +2239,52 @@ Event3to2(const SDL_Event *event3, SDL2_Event *event2)
             break;
         }
         break;
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+        event2->caxis.which = JoystickID3to2(event3->gaxis.which);
+        break;
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+    case SDL_EVENT_GAMEPAD_BUTTON_UP:
+        event2->cbutton.which = JoystickID3to2(event3->gbutton.which);
+        if (ShouldSwapGamepadButtons(event2->cbutton.which)) {
+            event2->cbutton.button = SwapGamepadButton(event2->cbutton.button);
+        }
+        break;
+    case SDL_EVENT_GAMEPAD_ADDED:
+        event2->cdevice.which = GetIndexFromJoystickInstance(event3->gdevice.which);
+        break;
+    case SDL_EVENT_GAMEPAD_REMOVED:
+    case SDL_EVENT_GAMEPAD_REMAPPED:
+    case SDL_EVENT_GAMEPAD_STEAM_HANDLE_UPDATED:
+        event2->cdevice.which = JoystickID3to2(event3->gdevice.which);
+        break;
+    case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
+    case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION:
+    case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
+        event2->ctouchpad.which = JoystickID3to2(event3->gtouchpad.which);
+        break;
+    /* sensor timestamps are in nanosecond in SDL3 */
+    case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
+        event2->csensor.which = JoystickID3to2(event3->gsensor.which);
+        event2->csensor.timestamp_us = SDL_NS_TO_US(event3->gsensor.sensor_timestamp);
+        break;
+    case SDL_EVENT_AUDIO_DEVICE_ADDED:
+        event2->adevice.which = GetIndexFromAudioDeviceInstance(event3->adevice.which, event3->adevice.recording);
+        break;
+    case SDL_EVENT_AUDIO_DEVICE_REMOVED:
+        event2->adevice.which = AudioDeviceID3to2(event3->adevice.which);
+        break;
+    case SDL_EVENT_SENSOR_UPDATE:
+        event2->sensor.which = SensorID3to2(event3->sensor.which);
+        event2->sensor.timestamp_us = SDL_NS_TO_US(event3->sensor.sensor_timestamp);
+        break;
     default:
         break;
     }
     return event2;
 }
 
-static SDL_Event *
-Event2to3(const SDL2_Event *event2, SDL_Event *event3)
+static SDL_Event *Event2to3(const SDL2_Event *event2, SDL_Event *event3)
 {
-#if 0
-    if (event2->type == SDL_SYSWMEVENT) {
-        return SDL2_FALSE;  /* !!! FIXME: figure out what to do with this. */
-    }
-#endif
-
     /* currently everything _mostly_ matches up between SDL2 and SDL3, but this might
        drift more as SDL3 development continues. */
 
@@ -1760,6 +2328,19 @@ Event2to3(const SDL2_Event *event2, SDL_Event *event3)
         event3->wheel.mouse_x = (float)event2->wheel.mouseX;
         event3->wheel.mouse_y = (float)event2->wheel.mouseY;
         break;
+    case SDL_EVENT_JOYSTICK_AXIS_MOTION:
+        event3->jaxis.which = JoystickID2to3(event2->jaxis.which);
+        break;
+    case SDL_EVENT_JOYSTICK_BALL_MOTION:
+        event3->jball.which = JoystickID2to3(event2->jball.which);
+        break;
+    case SDL_EVENT_JOYSTICK_HAT_MOTION:
+        event3->jhat.which = JoystickID2to3(event2->jhat.which);
+        break;
+    case SDL_EVENT_JOYSTICK_BUTTON_DOWN:
+    case SDL_EVENT_JOYSTICK_BUTTON_UP:
+        event3->jbutton.which = JoystickID2to3(event2->jbutton.which);
+        break;
     case SDL_EVENT_JOYSTICK_ADDED:
         if (event2->jdevice.which >= 0 &&
             event2->jdevice.which < num_joysticks) {
@@ -1767,6 +2348,19 @@ Event2to3(const SDL2_Event *event2, SDL_Event *event3)
         } else {
             event3->jdevice.which = 0;
         }
+        break;
+    case SDL_EVENT_JOYSTICK_REMOVED:
+        event3->jdevice.which = JoystickID2to3(event2->jdevice.which);
+        break;
+    case SDL_EVENT_JOYSTICK_BATTERY_UPDATED:
+        /* This should never happen, but see Event3to2() for details */
+        break;
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+        event3->gaxis.which = JoystickID2to3(event2->caxis.which);
+        break;
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+    case SDL_EVENT_GAMEPAD_BUTTON_UP:
+        event3->gbutton.which = JoystickID2to3(event2->cbutton.which);
         break;
     case SDL_EVENT_GAMEPAD_ADDED:
         if (event2->cdevice.which >= 0 &&
@@ -1776,8 +2370,46 @@ Event2to3(const SDL2_Event *event2, SDL_Event *event3)
             event3->gdevice.which = 0;
         }
         break;
-    case SDL_EVENT_JOYSTICK_BATTERY_UPDATED:
-        /* This should never happen, but see Event3to2() for details */
+    case SDL_EVENT_GAMEPAD_REMOVED:
+    case SDL_EVENT_GAMEPAD_REMAPPED:
+    case SDL_EVENT_GAMEPAD_STEAM_HANDLE_UPDATED:
+        event3->gdevice.which = JoystickID2to3(event2->cdevice.which);
+        break;
+    case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
+    case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION:
+    case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
+        event3->gtouchpad.which = JoystickID2to3(event2->ctouchpad.which);
+        break;
+    case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
+        event3->gsensor.which = JoystickID2to3(event2->csensor.which);
+        event3->gsensor.sensor_timestamp = SDL_US_TO_NS(event2->csensor.timestamp_us);
+        break;
+    case SDL_EVENT_AUDIO_DEVICE_ADDED:
+        if (event2->adevice.iscapture) {
+            if (event2->adevice.which < (Uint32)AudioSDL3RecordingDevices.num_devices) {
+                event3->adevice.which = AudioSDL3RecordingDevices.devices[event2->adevice.which].devid;
+            } else {
+                event3->adevice.which = 0;
+            }
+        } else {
+            if (event2->adevice.which < (Uint32)AudioSDL3PlaybackDevices.num_devices) {
+                event3->adevice.which = AudioSDL3PlaybackDevices.devices[event2->adevice.which].devid;
+            } else {
+                event3->adevice.which = 0;
+            }
+        }
+        break;
+    case SDL_EVENT_AUDIO_DEVICE_REMOVED:
+        if (event2->adevice.which > 0 && event2->adevice.which <= SDL_arraysize(AudioOpenDevices)) {
+            SDL2_AudioStream *stream = AudioOpenDevices[event2->adevice.which - 1];
+            event3->adevice.which = stream ? SDL3_GetAudioStreamDevice(stream->stream3) : 0;
+        } else {
+            event3->adevice.which = 0;
+        }
+        break;
+    case SDL_EVENT_SENSOR_UPDATE:
+        event3->sensor.which = SensorID2to3(event2->sensor.which);
+        event3->sensor.sensor_timestamp = SDL_US_TO_NS(event2->sensor.timestamp_us);
         break;
     default:
         break;
@@ -1886,16 +2518,56 @@ RemoveSupercededWindowEvents(void *userdata, SDL2_Event *event)
     return 1;
 }
 
+#define SDL_PROP_SENSOR_TIMESTAMP "sdl2-compat.sensor.timestamp"
+
+#define SDL_PROP_GAMEPAD_UNKNOWN_TIMESTAMP "sdl2-compat.gamepad.timestamp.unknown"
+#define SDL_PROP_GAMEPAD_ACCEL_TIMESTAMP "sdl2-compat.gamepad.timestamp.accel"
+#define SDL_PROP_GAMEPAD_GYRO_TIMESTAMP "sdl2-compat.gamepad.timestamp.gyro"
+#define SDL_PROP_GAMEPAD_ACCEL_L_TIMESTAMP "sdl2-compat.gamepad.timestamp.accel_l"
+#define SDL_PROP_GAMEPAD_GYRO_L_TIMESTAMP "sdl2-compat.gamepad.timestamp.gyro_l"
+#define SDL_PROP_GAMEPAD_ACCEL_R_TIMESTAMP "sdl2-compat.gamepad.timestamp.accel_r"
+#define SDL_PROP_GAMEPAD_GYRO_R_TIMESTAMP "sdl2-compat.gamepad.timestamp.gyro_r"
+
+static const char *GetGamepadSensorTimestampPropertyName(SDL_SensorType type)
+{
+    switch (type)
+    {
+        case SDL_SENSOR_UNKNOWN:
+            return SDL_PROP_GAMEPAD_UNKNOWN_TIMESTAMP;
+        case SDL_SENSOR_ACCEL:
+            return SDL_PROP_GAMEPAD_ACCEL_TIMESTAMP;
+        case SDL_SENSOR_GYRO:
+            return SDL_PROP_GAMEPAD_GYRO_TIMESTAMP;
+        case SDL_SENSOR_ACCEL_L:
+            return SDL_PROP_GAMEPAD_ACCEL_L_TIMESTAMP;
+        case SDL_SENSOR_GYRO_L:
+            return SDL_PROP_GAMEPAD_GYRO_L_TIMESTAMP;
+        case SDL_SENSOR_ACCEL_R:
+            return SDL_PROP_GAMEPAD_ACCEL_R_TIMESTAMP;
+        case SDL_SENSOR_GYRO_R:
+            return SDL_PROP_GAMEPAD_GYRO_R_TIMESTAMP;
+        default:
+            return NULL;
+    }
+}
+
 static bool SDLCALL
 EventFilter3to2(void *userdata, SDL_Event *event3)
 {
     SDL2_Event event2;  /* note that event filters do not receive events as const! So we have to convert or copy it for each one! */
     bool post_event = true;
 
+    /* Drop SDL3 events which have no SDL2 equivalent and may incorrectly overlap with SDL2 event numbers. */
+    switch (event3->type) {
+        case SDL_EVENT_KEYBOARD_ADDED: /* Overlaps with SDL_TEXTEDITING_EXT */
+        case SDL_EVENT_KEYBOARD_REMOVED:
+            return false;
+    }
+
     GestureProcessEvent(event3);  /* this might need to generate new gesture events from touch input. */
 
-    /* Ensure joystick and haptic IDs are updated before calling Event3to2() */
     switch (event3->type) {
+        /* Ensure joystick and haptic IDs are updated before calling Event3to2() */
         case SDL_EVENT_JOYSTICK_ADDED:
         case SDL_EVENT_GAMEPAD_ADDED:
         case SDL_EVENT_GAMEPAD_REMOVED:
@@ -1903,6 +2575,27 @@ EventFilter3to2(void *userdata, SDL_Event *event3)
             SDL_NumJoysticks(); /* Refresh */
             SDL_NumHaptics(); /* Refresh */
             break;
+
+        case SDL_EVENT_AUDIO_DEVICE_ADDED:
+        case SDL_EVENT_AUDIO_DEVICE_REMOVED:
+            SDL_GetNumAudioDevices(event3->adevice.recording ? SDL2_TRUE : SDL2_FALSE); /* Refresh */
+            break;
+
+        /* Save the timestamp for the most recent sensor values */
+        case SDL_EVENT_SENSOR_UPDATE:
+            SDL3_SetNumberProperty(SDL3_GetSensorProperties(SDL3_GetSensorFromID(event3->sensor.which)),
+                                   SDL_PROP_SENSOR_TIMESTAMP,
+                                   SDL_NS_TO_US(event3->sensor.sensor_timestamp));
+            break;
+        case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
+            SDL3_SetNumberProperty(SDL3_GetGamepadProperties(SDL3_GetGamepadFromID(event3->gsensor.which)),
+                                   GetGamepadSensorTimestampPropertyName((SDL_SensorType)event3->gsensor.sensor),
+                                   SDL_NS_TO_US(event3->gsensor.sensor_timestamp));
+            break;
+    }
+
+    if (SDL2_EventLoggingVerbosity > 0) {
+        LogEvent2(Event3to2(event3, &event2));
     }
 
     if (EventFilter2) {
@@ -1957,15 +2650,9 @@ EventFilter3to2(void *userdata, SDL_Event *event3)
         case SDL_EVENT_WINDOW_ICCPROF_CHANGED:
         case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
             if (SDL3_EventEnabled(SDL2_WINDOWEVENT)) {
-                /* SDL3 promises a resize event when creating a window, but SDL2 did not, and this breaks ffplay, so filter it out to match SDL2. */
-                if (event3->type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
-                    SDL_Window *window = SDL3_GetWindowFromID(event3->window.windowID);
-                    const SDL_PropertiesID winprops = SDL3_GetWindowProperties(window);
-                    if (winprops && !SDL3_GetBooleanProperty(winprops, PROP_WINDOW_FILTERED_FIRST_RESIZE, false)) {
-                        SDL3_SetBooleanProperty(winprops, PROP_WINDOW_FILTERED_FIRST_RESIZE, true);
-                        post_event = false;
-                        break;  /* drop it. */
-                    }
+                if (event3->type == SDL_EVENT_WINDOW_RESIZED) {
+                    /* Do resize handling based on SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, which always fires */
+                    break;
                 }
 
                 event2.window.type = SDL2_WINDOWEVENT;
@@ -1978,16 +2665,50 @@ EventFilter3to2(void *userdata, SDL_Event *event3)
                 event2.window.data1 = event3->window.data1;
                 event2.window.data2 = event3->window.data2;
 
-                /* Fixes queue overflow with resize events that aren't processed */
                 if (event2.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-                    RemovePendingSizeChangedAndResizedEvents_Data resizedata;
-                    resizedata.new_event = &event2;
-                    resizedata.saw_resized = false;
-                    SDL_FilterEvents(RemovePendingSizeChangedAndResizedEvents, &resizedata);
-                    if (resizedata.saw_resized) { /* if there was a pending resize, make sure one at the new dimensions remains. */
-                        event2.window.event = SDL_WINDOWEVENT_RESIZED;
-                        SDL_PushEvent(&event2);
-                        event2.window.event = SDL_WINDOWEVENT_SIZE_CHANGED; /* then push the actual event next. */
+                    SDL_Window *window = SDL3_GetWindowFromID(event3->window.windowID);
+                    if (!window) {
+                        break;
+                    }
+
+                    /* The size changed event has the window size, not pixel size */
+                    SDL3_GetWindowSize(window, &event2.window.data1, &event2.window.data2);
+
+                    /* Fixes queue overflow with resize events that aren't processed */
+                    {
+                        SDL_PropertiesID props = SDL3_GetWindowProperties(window);
+                        RemovePendingSizeChangedAndResizedEvents_Data resizedata;
+                        resizedata.new_event = &event2;
+                        resizedata.saw_resized = false;
+                        SDL_FilterEvents(RemovePendingSizeChangedAndResizedEvents, &resizedata);
+                        if (resizedata.saw_resized) { /* if there was a pending resize, make sure one at the new dimensions remains. */
+                            event2.window.event = SDL_WINDOWEVENT_RESIZED;
+                            SDL_PushEvent(&event2);
+                            event2.window.event = SDL_WINDOWEVENT_SIZE_CHANGED; /* then push the actual event next. */
+                        } else {
+                            int expected_w = (int)SDL3_GetNumberProperty(props, PROP_WINDOW_EXPECTED_WIDTH, 0);
+                            int expected_h = (int)SDL3_GetNumberProperty(props, PROP_WINDOW_EXPECTED_HEIGHT, 0);
+                            float expected_scale = SDL3_GetFloatProperty(props, PROP_WINDOW_EXPECTED_SCALE, 0.0f);
+
+                            /* Store off the expected values for next time */
+                            SDL3_SetNumberProperty(props, PROP_WINDOW_EXPECTED_WIDTH, event2.window.data1);
+                            SDL3_SetNumberProperty(props, PROP_WINDOW_EXPECTED_HEIGHT, event2.window.data2);
+                            SDL3_SetFloatProperty(props, PROP_WINDOW_EXPECTED_SCALE, SDL3_GetWindowDisplayScale(window));
+                            if (!expected_w || !expected_h) {
+                                /* Don't send the initial size, SDL2 didn't in this case.
+                                 * ffplay breaks if the initial size is sent, see https://github.com/libsdl-org/sdl2-compat/issues/268 for details.
+                                 */
+                                break;
+                            }
+
+                            if (event2.window.data1 != expected_w ||
+                                event2.window.data2 != expected_h ||
+                                SDL3_GetWindowDisplayScale(window) != expected_scale) {
+                                event2.window.event = SDL_WINDOWEVENT_RESIZED;
+                                SDL_PushEvent(&event2);
+                                event2.window.event = SDL_WINDOWEVENT_SIZE_CHANGED; /* then push the actual event next. */
+                            }
+                        }
                     }
                 } else if (event2.window.event == SDL_WINDOWEVENT_MOVED || event2.window.event == SDL_WINDOWEVENT_EXPOSED) {
                     /* Flush old move and exposure events */
@@ -2091,6 +2812,11 @@ SDL_WaitEventTimeout(SDL2_Event *event2, int timeout)
             case SDL_EVENT_JOYSTICK_REMOVED:
                 SDL_NumJoysticks(); /* Refresh */
                 SDL_NumHaptics(); /* Refresh */
+                break;
+
+            case SDL_EVENT_AUDIO_DEVICE_ADDED:
+            case SDL_EVENT_AUDIO_DEVICE_REMOVED:
+                SDL_GetNumAudioDevices(event3.adevice.recording ? SDL2_TRUE : SDL2_FALSE); /* Refresh */
                 break;
         }
         Event3to2(&event3, event2);
@@ -2443,8 +3169,8 @@ SDL_GetRelativeMouseState(int *x, int *y)
 {
     float fx, fy;
     Uint32 ret = SDL3_GetRelativeMouseState(&fx, &fy);
-    if (x) *x = (int)fx;
-    if (y) *y = (int)fy;
+    if (x) *x = AccumulateFloatValueToInteger(&relative_mouse_state_x_frac, fx);
+    if (y) *y = AccumulateFloatValueToInteger(&relative_mouse_state_y_frac, fy);
     return ret;
 }
 
@@ -2959,20 +3685,6 @@ SDL_LoadWAV_RW(SDL2_RWops *rwops2, int freesrc, SDL2_AudioSpec *spec2, Uint8 **a
     return retval;
 }
 
-#define PROP_SURFACE2 "sdl2-compat.surface2"
-
-static void SDLCALL CleanupSurface2(void *userdata, void *value)
-{
-    SDL2_Surface *surface = (SDL2_Surface *)value;
-
-    if (surface->format) {
-        SDL_SetPixelFormatPalette(surface->format, NULL);
-        SDL_FreeFormat(surface->format);
-        surface->format = NULL;
-    }
-    SDL3_free(surface);
-}
-
 static SDL2_Surface *CreateSurface2from3(SDL_Surface *surface3)
 {
     /* Allocate the surface */
@@ -2984,7 +3696,7 @@ static SDL2_Surface *CreateSurface2from3(SDL_Surface *surface3)
 
     /* Link the surfaces */
     surface->map = (SDL_BlitMap *)surface3;
-    SDL3_SetPointerPropertyWithCleanup(SDL3_GetSurfaceProperties(surface3), PROP_SURFACE2, surface, CleanupSurface2, NULL);
+    SDL3_SetPointerProperty(SDL3_GetSurfaceProperties(surface3), PROP_SURFACE2, surface);
 
     surface->format = SDL_AllocFormat(surface3->format);
     if (!surface->format) {
@@ -3361,17 +4073,8 @@ SDL_CreateRGBSurfaceWithFormatFrom(void *pixels, int width, int height, int dept
 SDL_DECLSPEC void SDLCALL
 SDL_FreeSurface(SDL2_Surface *surface)
 {
-    const int total = (int) (SDL_arraysize(OldWindowSurfaces));
-    int i;
-
     if (!surface) {
         return;
-    }
-
-    for (i = 0; (i < total) && OldWindowSurfaces[i]; i++) {
-        if (OldWindowSurfaces[i] == surface) {
-            return;  /* this is a pointer from SDL_GetWindowSurface--a bug in the app--refuse to free it. */
-        }
     }
 
     if (surface->flags & SDL_DONTFREE) {
@@ -3382,7 +4085,19 @@ SDL_FreeSurface(SDL2_Surface *surface)
         return;
     }
 
-    SDL3_DestroySurface(Surface2to3(surface));
+    if (surface->map) {
+        SDL_Surface *surface3 = (SDL_Surface *)surface->map;
+        SDL3_DestroySurface(surface3);
+        surface->map = NULL;
+    }
+
+    if (surface->format) {
+        SDL_SetPixelFormatPalette(surface->format, NULL);
+        SDL_FreeFormat(surface->format);
+        surface->format = NULL;
+    }
+
+    SDL3_free(surface);
 }
 
 SDL_DECLSPEC int SDLCALL
@@ -3684,7 +4399,7 @@ SDL_GetTicks64(void)
     return SDL3_GetTicks();
 }
 
-SDL_DECLSPEC SDL2_bool SDLCALL SDL_GetWindowWMInfo(SDL_Window *window, SDL_SysWMinfo *info)
+SDL_DECLSPEC SDL2_bool SDLCALL SDL_GetWindowWMInfo(SDL_Window *window, SDL2_SysWMinfo *info)
 {
     const char *driver = SDL3_GetCurrentVideoDriver();
     SDL_PropertiesID props;
@@ -3731,9 +4446,9 @@ SDL_DECLSPEC SDL2_bool SDLCALL SDL_GetWindowWMInfo(SDL_Window *window, SDL_SysWM
                                          (Uint32)info->version.patch);
 
         /* Before 2.0.6, it was possible to build an SDL with Wayland support
-         * (SDL_SysWMinfo will be large enough to hold Wayland info), but build
+         * (SDL2_SysWMinfo will be large enough to hold Wayland info), but build
          * your app against SDL headers that didn't have Wayland support
-         * (SDL_SysWMinfo could be smaller than Wayland needs. This would lead
+         * (SDL2_SysWMinfo could be smaller than Wayland needs). This would lead
          * to an app properly using SDL_GetWindowWMInfo() but we'd accidentally
          * overflow memory on the stack or heap. To protect against this, we've
          * padded out the struct unconditionally in the headers and Wayland will
@@ -3797,20 +4512,26 @@ SDL_GameControllerSetSensorEnabled(SDL_GameController *gamecontroller, SDL_Senso
     return SDL3_SetGamepadSensorEnabled(gamecontroller, type, enabled) ? 0 : -1;
 }
 
-/* this API was removed in SDL3; use sensor event timestamps instead! */
 SDL_DECLSPEC int SDLCALL
 SDL_GameControllerGetSensorDataWithTimestamp(SDL_GameController *gamecontroller, SDL_SensorType type, Uint64 *timestamp, float *data, int num_values)
 {
-    SDL3_Unsupported();  /* !!! FIXME: maybe try to track this from SDL3 events if something needs this? I can't imagine this was widely used. */
-    return -1;
+    if (!SDL3_GetGamepadSensorData(gamecontroller, type, data, num_values)) {
+        return -1;
+    }
+
+    *timestamp = SDL3_GetNumberProperty(SDL3_GetGamepadProperties(gamecontroller), GetGamepadSensorTimestampPropertyName(type), 0);
+    return 0;
 }
 
-/* this API was removed in SDL3; use sensor event timestamps instead! */
 SDL_DECLSPEC int SDLCALL
 SDL_SensorGetDataWithTimestamp(SDL_Sensor *sensor, Uint64 *timestamp, float *data, int num_values)
 {
-    SDL3_Unsupported();  /* !!! FIXME: maybe try to track this from SDL3 events if something needs this? I can't imagine this was widely used. */
-    return -1;
+    if (!SDL3_GetSensorData(sensor, data, num_values)) {
+        return -1;
+    }
+
+    *timestamp = SDL3_GetNumberProperty(SDL3_GetSensorProperties(sensor), SDL_PROP_SENSOR_TIMESTAMP, 0);
+    return 0;
 }
 
 SDL_DECLSPEC int SDLCALL
@@ -4771,8 +5492,6 @@ SDL_GetRenderDriverInfo(int idx, SDL2_RendererInfo *info)
     return 0;
 }
 
-#define PROP_RENDERER_BATCHING "sdl2-compat.renderer.batching"
-
 static int FlushRendererIfNotBatching(SDL_Renderer *renderer)
 {
     const SDL_PropertiesID props = SDL3_GetRendererProperties(renderer);
@@ -4838,7 +5557,8 @@ SDL_CreateRenderer(SDL_Window *window, int idx, Uint32 flags)
     renderer = SDL3_CreateRenderer(window, name);
     props = SDL3_GetRendererProperties(renderer);
     if (props) {
-        SDL3_SetBooleanProperty(props, PROP_RENDERER_BATCHING, SDL2Compat_GetHintBoolean("SDL_RENDER_BATCHING", (name == NULL)));
+        SDL3_SetBooleanProperty(props, PROP_RENDERER_BATCHING, SDL3_GetHintBoolean("SDL_RENDER_BATCHING", (name == NULL)));
+        SDL3_SetBooleanProperty(props, PROP_RENDERER_RELATIVE_SCALING, SDL3_GetHintBoolean("SDL_MOUSE_RELATIVE_SCALING", true));
     }
     if (flags & SDL2_RENDERER_PRESENTVSYNC) {
         SDL3_SetRenderVSync(renderer, 1);
@@ -4901,7 +5621,20 @@ SDL_RenderGetClipRect(SDL_Renderer *renderer, SDL_Rect *rect)
 SDL_DECLSPEC void SDLCALL
 SDL_RenderGetScale(SDL_Renderer *renderer, float *scaleX, float *scaleY)
 {
+    int w = 0, h = 0;
+    SDL_FRect rect;
+
     SDL3_GetRenderScale(renderer, scaleX, scaleY);
+
+    /* Include the logical scale */
+    SDL3_GetRenderLogicalPresentation(renderer, &w, &h, NULL);
+    SDL3_GetRenderLogicalPresentationRect(renderer, &rect);
+    if (scaleX && w > 0) {
+        *scaleX *= rect.w / w;
+    }
+    if (scaleY && h > 0) {
+        *scaleY *= rect.h / h;
+    }
 }
 
 SDL_DECLSPEC void SDLCALL
@@ -4927,11 +5660,22 @@ SDL_DECLSPEC int SDLCALL
 SDL_RenderSetLogicalSize(SDL_Renderer *renderer, int w, int h)
 {
     int retval;
+    SDL_RendererLogicalPresentation mode;
+
     if (w == 0 && h == 0) {
-        retval = SDL3_SetRenderLogicalPresentation(renderer, 0, 0, SDL_LOGICAL_PRESENTATION_DISABLED) ? 0 : -1;
+        mode = SDL_LOGICAL_PRESENTATION_DISABLED;
+    } else if (SDL3_GetBooleanProperty(SDL3_GetRendererProperties(renderer), PROP_RENDERER_INTEGER_SCALE, false)) {
+        mode = SDL_LOGICAL_PRESENTATION_INTEGER_SCALE;
     } else {
-        retval = SDL3_SetRenderLogicalPresentation(renderer, w, h, SDL_LOGICAL_PRESENTATION_LETTERBOX) ? 0 : -1;
+        const char *hint = SDL3_GetHint("SDL_RENDER_LOGICAL_SIZE_MODE");
+        if (hint && (*hint == '1' || SDL3_strcasecmp(hint, "overscan") == 0)) {
+            mode = SDL_LOGICAL_PRESENTATION_OVERSCAN;
+        } else {
+            mode = SDL_LOGICAL_PRESENTATION_LETTERBOX;
+        }
     }
+
+    retval = SDL3_SetRenderLogicalPresentation(renderer, w, h, mode) ? 0 : -1;
     return retval < 0 ? retval : FlushRendererIfNotBatching(renderer);
 }
 
@@ -4944,41 +5688,17 @@ SDL_RenderGetLogicalSize(SDL_Renderer *renderer, int *w, int *h)
 SDL_DECLSPEC int SDLCALL
 SDL_RenderSetIntegerScale(SDL_Renderer *renderer, SDL2_bool enable)
 {
-    SDL_RendererLogicalPresentation mode;
-    int w, h;
-    int retval;
+    int w = 0, h = 0;
 
-    retval = SDL3_GetRenderLogicalPresentation(renderer, &w, &h, &mode) ? 0 : -1;
-    if (retval < 0) {
-        return retval;
-    }
-
-    if (enable && mode == SDL_LOGICAL_PRESENTATION_INTEGER_SCALE) {
-        return 0;
-    }
-
-    if (!enable && mode != SDL_LOGICAL_PRESENTATION_INTEGER_SCALE) {
-        return 0;
-    }
-
-    if (enable) {
-        retval = SDL3_SetRenderLogicalPresentation(renderer, w, h, SDL_LOGICAL_PRESENTATION_INTEGER_SCALE) ? 0 : -1;
-    } else {
-        retval = SDL3_SetRenderLogicalPresentation(renderer, w, h, SDL_LOGICAL_PRESENTATION_DISABLED) ? 0 : -1;
-    }
-    return retval < 0 ? retval : FlushRendererIfNotBatching(renderer);
+    SDL3_SetBooleanProperty(SDL3_GetRendererProperties(renderer), PROP_RENDERER_INTEGER_SCALE, enable);
+    SDL_RenderGetLogicalSize(renderer, &w, &h);
+    return SDL_RenderSetLogicalSize(renderer, w, h);
 }
 
 SDL_DECLSPEC SDL2_bool SDLCALL
 SDL_RenderGetIntegerScale(SDL_Renderer *renderer)
 {
-    SDL_RendererLogicalPresentation mode;
-    if (SDL3_GetRenderLogicalPresentation(renderer, NULL, NULL, &mode)) {
-        if (mode == SDL_LOGICAL_PRESENTATION_INTEGER_SCALE) {
-            return SDL2_TRUE;
-        }
-    }
-    return SDL2_FALSE;
+    return SDL3_GetBooleanProperty(SDL3_GetRendererProperties(renderer), PROP_RENDERER_INTEGER_SCALE, false) ? SDL2_TRUE : SDL2_FALSE;
 }
 
 SDL_DECLSPEC int SDLCALL
@@ -5026,13 +5746,14 @@ SDL_RenderDrawPoints(SDL_Renderer *renderer,
     SDL_FPoint *fpoints;
     int i;
     int retval;
+    int isstack;
 
     if (points == NULL) {
         SDL3_InvalidParamError("points");
         return -1;
     }
 
-    fpoints = (SDL_FPoint *) SDL3_malloc(sizeof (SDL_FPoint) * count);
+    fpoints = SDL3_small_alloc(SDL_FPoint, count, &isstack);
     if (fpoints == NULL) {
         return -1;
     }
@@ -5044,7 +5765,7 @@ SDL_RenderDrawPoints(SDL_Renderer *renderer,
 
     retval = SDL3_RenderPoints(renderer, fpoints, count) ? 0 : -1;
 
-    SDL3_free(fpoints);
+    SDL3_small_free(fpoints, isstack);
 
     return retval < 0 ? retval : FlushRendererIfNotBatching(renderer);
 }
@@ -5081,6 +5802,7 @@ SDL_RenderDrawLines(SDL_Renderer *renderer, const SDL_Point *points, int count)
     SDL_FPoint *fpoints;
     int i;
     int retval;
+    int isstack;
 
     if (points == NULL) {
         SDL3_InvalidParamError("points");
@@ -5090,7 +5812,7 @@ SDL_RenderDrawLines(SDL_Renderer *renderer, const SDL_Point *points, int count)
         return 0;
     }
 
-    fpoints = (SDL_FPoint *) SDL3_malloc(sizeof (SDL_FPoint) * count);
+    fpoints = SDL3_small_alloc(SDL_FPoint, count, &isstack);
     if (fpoints == NULL) {
         return -1;
     }
@@ -5102,7 +5824,7 @@ SDL_RenderDrawLines(SDL_Renderer *renderer, const SDL_Point *points, int count)
 
     retval = SDL3_RenderLines(renderer, fpoints, count) ? 0 : -1;
 
-    SDL3_free(fpoints);
+    SDL3_small_free(fpoints, isstack);
 
     return retval < 0 ? retval : FlushRendererIfNotBatching(renderer);
 }
@@ -5136,7 +5858,10 @@ SDL_RenderDrawRect(SDL_Renderer *renderer, const SDL_Rect *rect)
 SDL_DECLSPEC int SDLCALL
 SDL_RenderDrawRects(SDL_Renderer *renderer, const SDL_Rect *rects, int count)
 {
+    SDL_FRect *frects;
     int i;
+    int retval;
+    int isstack;
 
     if (rects == NULL) {
         SDL3_InvalidParamError("rects");
@@ -5146,12 +5871,23 @@ SDL_RenderDrawRects(SDL_Renderer *renderer, const SDL_Rect *rects, int count)
         return 0;
     }
 
-    for (i = 0; i < count; ++i) {
-        if (SDL_RenderDrawRect(renderer, &rects[i]) < 0) {
-            return -1;
-        }
+    frects = SDL3_small_alloc(SDL_FRect, count, &isstack);
+    if (frects == NULL) {
+        return -1;
     }
-    return 0;
+
+    for (i = 0; i < count; ++i) {
+        frects[i].x = (float)rects[i].x;
+        frects[i].y = (float)rects[i].y;
+        frects[i].w = (float)rects[i].w;
+        frects[i].h = (float)rects[i].h;
+    }
+
+    retval = SDL3_RenderRects(renderer, frects, count) ? 0 : -1;
+
+    SDL3_small_free(frects, isstack);
+
+    return retval < 0 ? retval : FlushRendererIfNotBatching(renderer);
 }
 
 SDL_DECLSPEC int SDLCALL
@@ -5178,9 +5914,10 @@ SDL_RenderFillRect(SDL_Renderer *renderer, const SDL_Rect *rect)
         frect.y = (float)rect->y;
         frect.w = (float)rect->w;
         frect.h = (float)rect->h;
-        return SDL3_RenderFillRect(renderer, &frect) ? 0 : -1;
+        retval = SDL3_RenderFillRect(renderer, &frect) ? 0 : -1;
+    } else {
+        retval = SDL3_RenderFillRect(renderer, NULL) ? 0 : -1;
     }
-    retval = SDL3_RenderFillRect(renderer, NULL) ? 0 : -1;
     return retval < 0 ? retval : FlushRendererIfNotBatching(renderer);
 }
 
@@ -5190,6 +5927,7 @@ SDL_RenderFillRects(SDL_Renderer *renderer, const SDL_Rect *rects, int count)
     SDL_FRect *frects;
     int i;
     int retval;
+    int isstack;
 
     if (rects == NULL) {
         SDL3_InvalidParamError("rects");
@@ -5199,7 +5937,7 @@ SDL_RenderFillRects(SDL_Renderer *renderer, const SDL_Rect *rects, int count)
         return 0;
     }
 
-    frects = (SDL_FRect *) SDL3_malloc(sizeof (SDL_FRect) * count);
+    frects = SDL3_small_alloc(SDL_FRect, count, &isstack);
     if (frects == NULL) {
         return -1;
     }
@@ -5213,7 +5951,7 @@ SDL_RenderFillRects(SDL_Renderer *renderer, const SDL_Rect *rects, int count)
 
     retval = SDL3_RenderFillRects(renderer, frects, count) ? 0 : -1;
 
-    SDL3_free(frects);
+    SDL3_small_free(frects, isstack);
 
     return retval < 0 ? retval : FlushRendererIfNotBatching(renderer);
 }
@@ -5368,7 +6106,7 @@ SDL_RenderGeometryRaw(SDL_Renderer *renderer, SDL_Texture *texture, const float 
         return -1;
     }
 
-    color3 = (SDL_FColor *) SDL3_small_alloc(SDL_FColor, num_vertices, &isstack);
+    color3 = SDL3_small_alloc(SDL_FColor, num_vertices, &isstack);
     if (!color3) {
         SDL3_OutOfMemory();
         return -1;
@@ -5567,20 +6305,309 @@ SDL_RemoveTimer(SDL2_TimerID id)
     return SDL3_RemoveTimer((SDL_TimerID)id) ? SDL2_TRUE : SDL2_FALSE;
 }
 
+typedef enum {
+    V2H_PASSTHROUGH,   /* Leave value unchanged */
+    V2H_BOOL,          /* 0 = value unset, 1 = value set */
+    V2H_BOOL_INVERTED, /* 1 = value unset, 0 = value set */
+} VarToHintConversionType;
+
+static struct {
+    const char *old_envvar;
+    const char *new_hint;
+    VarToHintConversionType type;
+} envvars_to_hints[] = {
+    { "SDL_DISKAUDIOFILE", SDL_HINT_AUDIO_DISK_OUTPUT_FILE, V2H_PASSTHROUGH },
+    { "SDL_DISKAUDIOFILEIN", SDL_HINT_AUDIO_DISK_INPUT_FILE, V2H_PASSTHROUGH },
+    { "SDL_HIDAPI_DISABLE_LIBUSB", SDL_HINT_HIDAPI_LIBUSB, V2H_BOOL_INVERTED },
+    { "SDL_HIDAPI_JOYSTICK_DISABLE_UDEV", SDL_HINT_HIDAPI_UDEV, V2H_BOOL_INVERTED },
+#ifdef SDL_PLATFORM_FREEBSD
+    { "SDL_INPUT_FREEBSD_KEEP_KBD", SDL_HINT_MUTE_CONSOLE_KEYBOARD, V2H_BOOL_INVERTED },
+#endif
+#ifdef SDL_PLATFORM_LINUX
+    { "SDL_INPUT_LINUX_KEEP_KBD", SDL_HINT_MUTE_CONSOLE_KEYBOARD, V2H_BOOL_INVERTED },
+#endif
+#ifdef SDL_PLATFORM_VITA
+    { "VITA_DISABLE_TOUCH_BACK", SDL_HINT_VITA_ENABLE_BACK_TOUCH, V2H_BOOL_INVERTED },
+    { "VITA_DISABLE_TOUCH_FRONT", SDL_HINT_VITA_ENABLE_FRONT_TOUCH, V2H_BOOL_INVERTED },
+    { "VITA_MODULE_PATH", SDL_HINT_VITA_MODULE_PATH, V2H_PASSTHROUGH },
+    { "VITA_PVR_OGL", SDL_HINT_VITA_PVR_OPENGL, V2H_BOOL },
+    { "VITA_PVR_SKIP_INIT", SDL_HINT_VITA_PVR_INIT, V2H_BOOL_INVERTED },
+    { "VITA_RESOLUTION", SDL_HINT_VITA_RESOLUTION, V2H_PASSTHROUGH },
+#endif
+};
+
+static void SDL2COMPAT_SetEnvironmentVariable(SDL_Environment *env, const char *name, const char *value, bool overwrite)
+{
+    unsigned int i;
+
+    /* Propagate the original variable name and value, so SDL_getenv() works as expected */
+    if (value) {
+        SDL3_SetEnvironmentVariable(env, name, value, overwrite);
+    } else {
+        SDL3_UnsetEnvironmentVariable(env, name);
+    }
+
+    /* Handle environment variables that became hints in SDL3  */
+    for (i = 0; i < SDL_arraysize(envvars_to_hints); ++i) {
+        if (SDL3_strcmp(name, envvars_to_hints[i].old_envvar) == 0) {
+            const char *value3 = NULL;
+
+            switch (envvars_to_hints[i].type) {
+            case V2H_BOOL:
+                value3 = value ? "1" : "0";
+                break;
+            case V2H_BOOL_INVERTED:
+                value3 = value ? "0" : "1";
+                break;
+            case V2H_PASSTHROUGH:
+                value3 = value;
+                break;
+            }
+
+            if (value3) {
+                SDL3_SetEnvironmentVariable(env, envvars_to_hints[i].new_hint, value3, overwrite);
+            } else {
+                SDL3_UnsetEnvironmentVariable(env, envvars_to_hints[i].new_hint);
+            }
+        }
+    }
+
+    /* Handle renamed hints set via environment variables */
+    for (i = 0; i < SDL_arraysize(renamed_hints); ++i) {
+        if (SDL3_strcmp(name, renamed_hints[i].old_hint) == 0) {
+            bool free_value = false;
+            const char *value3 = SDL2_to_SDL3_hint_value(name, value, &free_value);
+
+            if (value3) {
+                SDL3_SetEnvironmentVariable(env, renamed_hints[i].new_hint, value3, overwrite);
+            } else {
+                SDL3_UnsetEnvironmentVariable(env, renamed_hints[i].new_hint);
+            }
+
+            if (free_value) {
+                SDL3_free((void *)value3);
+            }
+        }
+    }
+}
+
+static void SynchronizeEnvironmentVariables()
+{
+    SDL_Environment *env = SDL3_GetEnvironment();
+    SDL_Environment *fresh_env = SDL3_CreateEnvironment(true);
+    char **envp;
+    char **fresh_envp;
+    int i;
+
+    /* Clear variables that are no longer set in the environment */
+    envp = SDL3_GetEnvironmentVariables(env);
+    if (envp) {
+        for (i = 0; envp[i]; ++i) {
+            char *sep = SDL3_strchr(envp[i], '=');
+            *sep = '\0';
+
+            if (SDL3_GetEnvironmentVariable(fresh_env, envp[i]) == NULL) {
+                SDL2COMPAT_SetEnvironmentVariable(env, envp[i], NULL, true);
+            }
+        }
+
+        SDL3_free(envp);
+    }
+
+    /* Set variables that are present in the environment */
+    fresh_envp = SDL3_GetEnvironmentVariables(fresh_env);
+    if (fresh_envp) {
+        for (i = 0; fresh_envp[i]; ++i) {
+            char *sep = SDL3_strchr(fresh_envp[i], '=');
+            *sep = '\0';
+            SDL2COMPAT_SetEnvironmentVariable(env, fresh_envp[i], sep + 1, true);
+        }
+
+        SDL3_free(fresh_envp);
+    }
+
+    SDL3_DestroyEnvironment(fresh_env);
+}
+
+SDL_DECLSPEC int SDLCALL
+SDL_setenv(const char *name, const char *value, int overwrite)
+{
+    int retval;
+
+    retval = SDL3_setenv_unsafe(name, value, overwrite);
+    if (retval == 0) {
+        SDL2COMPAT_SetEnvironmentVariable(SDL3_GetEnvironment(), name, value, overwrite != 0);
+    }
+
+    return retval;
+}
+
+static SDL_InitFlags PreInitSubsystem(SDL_InitFlags flags)
+{
+    /* If the subsystem is already initialized, mask out the flag for it */
+    flags &= ~SDL_WasInit(flags);
+
+    if (flags & SDL_INIT_VIDEO) {
+        const char *old_hint;
+        const char *hint;
+
+        /* Update IME UI hint */
+#if defined(SDL_PLATFORM_WIN32)
+        old_hint = SDL3_GetHint("SDL_IME_SHOW_UI");
+        if (old_hint && *old_hint == '1') {
+            hint = "composition";
+        } else {
+            hint = "composition,candidates";
+        }
+#else
+        old_hint = SDL3_GetHint("SDL_IME_INTERNAL_EDITING");
+        if (old_hint && *old_hint == '1') {
+            hint = "0";
+        } else {
+            hint = "composition";
+        }
+#endif
+        SDL3_SetHint(SDL_HINT_IME_IMPLEMENTED_UI, hint);
+    }
+
+    /* Return only the flags that we will expect to change */
+    return flags;
+}
+
+static void PostInitSubsystem(SDL_InitFlags new_flags)
+{
+    /* The timer subsystem flag is gone in SDL3, so we maintain it ourselves */
+    if (new_flags & SDL2_INIT_TIMER) {
+        ++timer_init;
+    }
+
+    /* Gamepads imply the joystick subsystem */
+    if (new_flags & SDL_INIT_GAMEPAD) {
+        new_flags |= SDL_INIT_JOYSTICK;
+    }
+
+    /* Some subsystems imply the events subsystem */
+    if (new_flags & (SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_JOYSTICK)) {
+        new_flags |= SDL_INIT_EVENTS;
+    }
+
+    /* If the subsystem failed to initialize, mask out the flag for it */
+    new_flags &= SDL_WasInit(new_flags);
+
+    if (new_flags & SDL_INIT_EVENTS) {
+        (void)SDL_EventState(SDL2_SYSWMEVENT, SDL2_DISABLE);
+
+        /* SDL_GetRelativeMouseState() resets when the event subsystem initializes */
+        relative_mouse_state_x_frac = 0.0f;
+        relative_mouse_state_y_frac = 0.0f;
+    }
+
+    if (new_flags & SDL_INIT_VIDEO) {
+        /* default SDL2 GL attributes */
+        SDL_GL_SetAttribute(SDL2_GL_RED_SIZE, 3);
+        SDL_GL_SetAttribute(SDL2_GL_GREEN_SIZE, 3);
+        SDL_GL_SetAttribute(SDL2_GL_BLUE_SIZE, 2);
+        SDL_GL_SetAttribute(SDL2_GL_ALPHA_SIZE, 0);
+
+#if !defined(SDL_PLATFORM_IOS) && !defined(SDL_PLATFORM_ANDROID)  // (and maybe others...?)
+        /* SDL2 enables text input during video subsystem init on desktop platforms */
+        (void)SDL_EventState(SDL_EVENT_TEXT_INPUT, SDL2_ENABLE);
+        (void)SDL_EventState(SDL_EVENT_TEXT_EDITING, SDL2_ENABLE);
+#endif
+    }
+
+    /* if audio was initialized and there are no devices enumerated yet, build some initial device lists. */
+    if (new_flags & SDL_INIT_AUDIO) {
+        if (AudioSDL3PlaybackDevices.num_devices == 0) {
+            SDL_GetNumAudioDevices(SDL2_FALSE);
+        }
+        if (AudioSDL3RecordingDevices.num_devices == 0) {
+            SDL_GetNumAudioDevices(SDL2_TRUE);
+        }
+    }
+
+    /* enumerate joysticks and haptics to build device list */
+    if (new_flags & SDL_INIT_JOYSTICK) {
+        SDL_NumJoysticks();
+    }
+    if (new_flags & SDL_INIT_HAPTIC) {
+        SDL_NumHaptics();
+    }
+}
+
+static int InitSubsystemInternal(SDL_InitFlags flags)
+{
+    int result;
+    SDL_InitFlags new_flags;
+
+    if (!SDL2Compat_InitOnStartup()) {
+        return -1;
+    }
+
+    new_flags = PreInitSubsystem(flags);
+
+    result = SDL3_InitSubSystem(flags) ? 0 : -1;
+
+    PostInitSubsystem(new_flags);
+
+    return result;
+}
+
+static void PostQuitSubsystem(SDL_InitFlags quit_flags)
+{
+    /* Mask out the subsystems that didn't actually quit */
+    quit_flags &= ~SDL_WasInit(quit_flags);
+
+    if (quit_flags & SDL_INIT_VIDEO) {
+        GestureQuit();
+    }
+
+    if (quit_flags & SDL_INIT_AUDIO) {
+        int i;
+
+        /* Close all open audio devices like SDL2 did */
+        for (i = 0; i < (int)SDL_arraysize(AudioOpenDevices); i++) {
+            SDL_FreeAudioStream(AudioOpenDevices[i]);
+            AudioOpenDevices[i] = NULL;
+        }
+    }
+}
+
+static void QuitSubsystemInternal(SDL_InitFlags flags)
+{
+    SDL_InitFlags old_flags;
+
+    old_flags = SDL_WasInit(flags);
+
+    SDL3_QuitSubSystem(flags);
+
+    PostQuitSubsystem(old_flags);
+}
 
 SDL_DECLSPEC int SDLCALL
 SDL_AudioInit(const char *driver_name)
 {
-    if (driver_name) {
-        SDL3_SetHint("SDL_AUDIO_DRIVER", driver_name);
+    SynchronizeEnvironmentVariables();
+
+    if (SDL3_GetCurrentAudioDriver()) {
+        /* Shutdown the current driver before starting again */
+        SDL_AudioQuit();
     }
-    return SDL3_InitSubSystem(SDL_INIT_AUDIO) ? 0 : -1;
+
+    if (driver_name) {
+        SDL3_SetHintWithPriority(SDL_HINT_AUDIO_DRIVER, driver_name, SDL_HINT_OVERRIDE);
+    }
+
+    return InitSubsystemInternal(SDL_INIT_AUDIO);
 }
 
 SDL_DECLSPEC void SDLCALL
 SDL_AudioQuit(void)
 {
-    SDL3_QuitSubSystem(SDL_INIT_AUDIO);
+    /* SDL_AudioQuit() ignores subsystem refcounting */
+    while (SDL_WasInit(SDL_INIT_AUDIO)) {
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    }
 }
 
 SDL_DECLSPEC int SDLCALL
@@ -5776,26 +6803,27 @@ SDL_GL_SetAttribute(SDL2_GLattr attr, int value)
 SDL_DECLSPEC int SDLCALL
 SDL_VideoInit(const char *driver_name)
 {
-    int ret;
-    if (driver_name) {
-        SDL3_SetHint("SDL_VIDEO_DRIVER", driver_name);
+    SynchronizeEnvironmentVariables();
+
+    if (SDL3_GetCurrentVideoDriver()) {
+        /* Shutdown the current driver before starting again */
+        SDL_VideoQuit();
     }
 
-    ret = SDL3_InitSubSystem(SDL_INIT_VIDEO) ? 0 : -1;
+    if (driver_name) {
+        SDL3_SetHintWithPriority(SDL_HINT_VIDEO_DRIVER, driver_name, SDL_HINT_OVERRIDE);
+    }
 
-    /* default SDL2 GL attributes */
-    SDL_GL_SetAttribute(SDL2_GL_RED_SIZE, 3);
-    SDL_GL_SetAttribute(SDL2_GL_GREEN_SIZE, 3);
-    SDL_GL_SetAttribute(SDL2_GL_BLUE_SIZE, 2);
-    SDL_GL_SetAttribute(SDL2_GL_ALPHA_SIZE, 0);
-
-    return ret;
+    return InitSubsystemInternal(SDL_INIT_VIDEO);
 }
 
 SDL_DECLSPEC void SDLCALL
 SDL_VideoQuit(void)
 {
-    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    /* SDL_VideoQuit() ignores subsystem refcounting */
+    while (SDL_WasInit(SDL_INIT_VIDEO)) {
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    }
 }
 
 SDL_DECLSPEC int SDLCALL
@@ -5807,59 +6835,9 @@ SDL_Init(Uint32 flags)
 SDL_DECLSPEC int SDLCALL
 SDL_InitSubSystem(Uint32 flags)
 {
-    int result;
+    SynchronizeEnvironmentVariables();
 
-    if (!SDL2Compat_InitOnStartup()) {
-        return -1;
-    }
-
-    /* Update IME UI hint */
-    if (flags & SDL_INIT_VIDEO) {
-        const char *old_hint;
-        const char *hint;
-
-#if defined(SDL_PLATFORM_WIN32)
-        old_hint = SDL_GetHint("SDL_IME_SHOW_UI");
-        if (old_hint && *old_hint == '1') {
-            hint = "composition";
-        } else {
-            hint = "composition,candidates";
-        }
-#else
-        old_hint = SDL_GetHint("SDL_IME_INTERNAL_EDITING");
-        if (old_hint && *old_hint == '1') {
-            hint = "0";
-        } else {
-            hint = "composition";
-        }
-#endif
-        SDL_SetHint(SDL_HINT_IME_IMPLEMENTED_UI, hint);
-    }
-
-    result = SDL3_InitSubSystem(flags) ? 0 : -1;
-    if (result == 0) {
-        if (flags & SDL2_INIT_TIMER) {
-            ++timer_init;
-        }
-        if (flags & SDL_INIT_VIDEO) {
-            /* default SDL2 GL attributes */
-            SDL_GL_SetAttribute(SDL2_GL_RED_SIZE, 3);
-            SDL_GL_SetAttribute(SDL2_GL_GREEN_SIZE, 3);
-            SDL_GL_SetAttribute(SDL2_GL_BLUE_SIZE, 2);
-            SDL_GL_SetAttribute(SDL2_GL_ALPHA_SIZE, 0);
-        }
-
-        /* if audio was initialized and there are no devices enumerated yet, build some initial device lists. */
-        if ((flags & SDL_INIT_AUDIO) && SDL3_WasInit(SDL_INIT_AUDIO)) {
-            if (AudioSDL3PlaybackDevices.num_devices == 0) {
-                SDL_GetNumAudioDevices(SDL2_FALSE);
-            }
-            if (AudioSDL3RecordingDevices.num_devices == 0) {
-                SDL_GetNumAudioDevices(SDL2_TRUE);
-            }
-        }
-    }
-    return result;
+    return InitSubsystemInternal(flags);
 }
 
 SDL_DECLSPEC Uint32 SDLCALL
@@ -5877,19 +6855,29 @@ SDL_Quit(void)
 {
     int i;
     SDL_LogPriority priorities[SDL_LOG_CATEGORY_CUSTOM];
+    SDL_InitFlags old_flags;
+
     relative_mouse_mode = SDL2_FALSE;
 
     timer_init = 0;
 
-    if (SDL3_WasInit(SDL_INIT_VIDEO)) {
-        GestureQuit();
+    if (joystick_instance_list) {
+        SDL3_free(joystick_instance_list);
+        joystick_instance_list = NULL;
     }
+    num_joystick_instances = 0;
 
     if (joystick_list) {
         SDL3_free(joystick_list);
         joystick_list = NULL;
     }
     num_joysticks = 0;
+
+    if (sensor_instance_list) {
+        SDL3_free(sensor_instance_list);
+        sensor_instance_list = NULL;
+    }
+    num_sensor_instances = 0;
 
     if (sensor_list) {
         SDL3_free(sensor_list);
@@ -5932,7 +6920,9 @@ SDL_Quit(void)
 
     SDL2Compat_Quit();
 
+    old_flags = SDL_WasInit(0);
     SDL3_Quit();
+    PostQuitSubsystem(old_flags);
 
     for (i = 0; i < SDL_LOG_CATEGORY_CUSTOM; i++) {
         SDL3_SetLogPriority(i, priorities[i]);
@@ -5946,13 +6936,9 @@ SDL_QuitSubSystem(Uint32 flags)
         --timer_init;
     }
 
-    if (flags & SDL_INIT_VIDEO) {
-        GestureQuit();
-    }
-
     // !!! FIXME: there's cleanup in SDL_Quit that probably needs to be done here, too.
 
-    SDL3_QuitSubSystem(flags);
+    QuitSubsystemInternal(flags);
 }
 
 SDL_DECLSPEC int SDLCALL
@@ -6022,7 +7008,7 @@ static int GetNumAudioDevices(int iscapture)
                So if you have two "SoundBlaster Pro 16" devices, one will be
                "SoundBlaster Pro 16" and the other will be "SoundBlaster Pro 16 (2)" */
             for (j = 0; j < i; j++) {
-                if (SDL_strcmp(newname, orignames[j]) == 0) {
+                if (SDL3_strcmp(newname, orignames[j]) == 0) {
                     dupenum++;
                 }
             }
@@ -6150,7 +7136,7 @@ SDL_GetDefaultAudioInfo(char **name, SDL2_AudioSpec *spec2, int iscapture)
         return -1;
     }
 
-    retval = SDL3_GetAudioDeviceFormat(iscapture ? SDL_AUDIO_DEVICE_DEFAULT_RECORDING : SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec3, NULL);
+    retval = SDL3_GetAudioDeviceFormat(iscapture ? SDL_AUDIO_DEVICE_DEFAULT_RECORDING : SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec3, NULL) ? 0 : -1;
     if (retval == 0) {
         if (name) {
             *name = SDL3_strdup("System default");  /* the default device can change to different physical hardware on-the-fly in SDL3, so we don't provide a name for it. */
@@ -6297,6 +7283,7 @@ static SDL_AudioDeviceID OpenAudioDeviceLocked(const char *devicename, int iscap
     SDL2_AudioStream *stream2;
     SDL_AudioDeviceID device3 = 0;
     SDL_AudioSpec spec3;
+    char samples_str[32];
     int id;
 
     SDL_assert(obtained2 != NULL);  /* we checked this before locking. */
@@ -6358,6 +7345,9 @@ static SDL_AudioDeviceID OpenAudioDeviceLocked(const char *devicename, int iscap
         spec3.format = SDL_AUDIO_S16BE;
     }
 
+    SDL3_snprintf(samples_str, sizeof (samples_str), "%u", (unsigned int) desired2->samples);
+    SDL3_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, samples_str);
+
     device3 = SDL3_OpenAudioDevice(device3, &spec3);
     if (device3 == 0) {
         return 0;
@@ -6370,7 +7360,7 @@ static SDL_AudioDeviceID OpenAudioDeviceLocked(const char *devicename, int iscap
         obtained2->format = (SDL2_AudioFormat)spec3.format;
     }
     if ((spec3.channels != obtained2->channels) && (allowed_changes & SDL2_AUDIO_ALLOW_CHANNELS_CHANGE)) {
-        obtained2->freq = spec3.channels;
+        obtained2->channels = spec3.channels;
     }
     if ((spec3.freq != obtained2->freq) && (allowed_changes & SDL2_AUDIO_ALLOW_FREQUENCY_CHANGE)) {
         obtained2->freq = spec3.freq;
@@ -6389,15 +7379,18 @@ static SDL_AudioDeviceID OpenAudioDeviceLocked(const char *devicename, int iscap
         return 0;
     }
 
-    stream2->bytes_per_callbacks = obtained2->size;
-    stream2->callback2_buffer = SDL3_malloc(stream2->bytes_per_callbacks);
-    if (!stream2->callback2_buffer) {
-        SDL_FreeAudioStream(stream2);
-        SDL3_CloseAudioDevice(device3);
-        return 0;
-    }
-
     if (desired2->callback) {
+        stream2->bytes_per_callbacks = obtained2->size;
+        stream2->callback2_buffer = SDL3_malloc(stream2->bytes_per_callbacks);
+        if (!stream2->callback2_buffer) {
+            SDL_FreeAudioStream(stream2);
+            SDL3_CloseAudioDevice(device3);
+            return 0;
+        }
+
+        /* Some apps may leave the callback buffer unmodified, so initialize it with silence */
+        SDL3_memset(stream2->callback2_buffer, obtained2->silence, stream2->bytes_per_callbacks);
+
         stream2->callback2 = desired2->callback;
         stream2->callback2_userdata = desired2->userdata;
         if (iscapture) {
@@ -6456,7 +7449,7 @@ SDL_OpenAudio(SDL2_AudioSpec *desired2, SDL2_AudioSpec *obtained2)
 
     /* Start up the audio driver, if necessary. This is legacy behaviour! */
     if (!SDL3_WasInit(SDL_INIT_AUDIO)) {
-        if (!SDL3_InitSubSystem(SDL_INIT_AUDIO)) {
+        if (SDL_AudioInit(NULL) < 0) {
             return -1;
         }
     }
@@ -6522,6 +7515,16 @@ static void AudioSi16SysToUi16MSB(Uint16 *dst, const Sint16 *src, const size_t n
     }
 }
 
+static void SDLCALL CleanupStream2(void *userdata, void *value)
+{
+    SDL2_AudioStream *stream = (SDL2_AudioStream *)value;
+
+    /* The SDL3 audio stream is being cleaned up, make sure we don't double-free
+     * if the application frees the SDL2 audio stream later.
+     */
+    stream->stream3 = NULL;
+}
+
 SDL_DECLSPEC SDL2_AudioStream * SDLCALL
 SDL_NewAudioStream(const SDL2_AudioFormat real_src_format, const Uint8 src_channels, const int src_rate, const SDL2_AudioFormat real_dst_format, const Uint8 dst_channels, const int dst_rate)
 {
@@ -6553,6 +7556,7 @@ SDL_NewAudioStream(const SDL2_AudioFormat real_src_format, const Uint8 src_chann
         SDL3_free(retval);
         return NULL;
     }
+    SDL3_SetPointerPropertyWithCleanup(SDL3_GetAudioStreamProperties(retval->stream3), PROP_STREAM2, retval, CleanupStream2, NULL);
 
     retval->src_format = real_src_format;
     retval->dst_format = real_dst_format;
@@ -6616,14 +7620,16 @@ SDL_AudioStreamClear(SDL2_AudioStream *stream2)
 SDL_DECLSPEC int SDLCALL
 SDL_AudioStreamAvailable(SDL2_AudioStream *stream2)
 {
-    return SDL3_GetAudioStreamAvailable(stream2 ? stream2->stream3 : NULL);
+    return (stream2 && stream2->stream3) ? SDL3_GetAudioStreamAvailable(stream2->stream3) : 0;
 }
 
 SDL_DECLSPEC void SDLCALL
 SDL_FreeAudioStream(SDL2_AudioStream *stream2)
 {
     if (stream2) {
-        SDL3_DestroyAudioStream(stream2->stream3);
+        if (stream2->stream3) {
+            SDL3_DestroyAudioStream(stream2->stream3);
+        }
         SDL3_free(stream2->callback2_buffer);
         SDL3_free(stream2);
     }
@@ -6682,7 +7688,27 @@ SDL_DECLSPEC Uint32 SDLCALL
 SDL_GetQueuedAudioSize(SDL_AudioDeviceID dev)
 {
     SDL2_AudioStream *stream2 = GetOpenAudioDevice(dev);
-    return (stream2 && (stream2->callback2 == NULL)) ? SDL3_GetAudioStreamAvailable(stream2->stream3) : 0;
+    SDL_AudioSpec src_spec, dst_spec;
+    int src_size, dst_size;
+    Sint64 available;
+
+    if (!stream2 || stream2->callback2) {
+        return 0;
+    }
+
+    if (!SDL3_GetAudioStreamFormat(stream2->stream3, &src_spec, &dst_spec)) {
+        return 0;
+    }
+
+    available = SDL3_GetAudioStreamAvailable(stream2->stream3);
+    if (available < 0) {
+        return 0;
+    }
+
+    src_size = src_spec.channels * src_spec.freq * SDL_AUDIO_BYTESIZE(src_spec.format);
+    dst_size = dst_spec.channels * dst_spec.freq * SDL_AUDIO_BYTESIZE(dst_spec.format);
+
+    return (Uint32)(available * src_size / dst_size);
 }
 
 SDL_DECLSPEC int SDLCALL
@@ -6735,7 +7761,9 @@ SDL_PauseAudioDevice(SDL_AudioDeviceID dev, int pause_on)
     SDL2_AudioStream *stream2 = GetOpenAudioDevice(dev);
     if (stream2) {
         const SDL_AudioDeviceID device3 = SDL3_GetAudioStreamDevice(stream2->stream3);
-        SDL3_ClearAudioStream(stream2->stream3);
+        if (stream2->callback2) {  // don't clear the stream for queued audio, just callback audio.
+            SDL3_ClearAudioStream(stream2->stream3);
+        }
         if (device3) {
             if (pause_on) {
                 SDL3_PauseAudioDevice(device3);
@@ -6912,7 +7940,7 @@ Display_IDToIndex(SDL_DisplayID displayID)
 {
     int displayIndex = 0;
     int count = 0, i;
-    const SDL_DisplayID *list;
+    SDL_DisplayID *list;
 
     if (displayID == 0) {
         SDL3_SetError("invalid displayID");
@@ -6923,6 +7951,7 @@ Display_IDToIndex(SDL_DisplayID displayID)
 
     if (list == NULL || count == 0) {
         SDL3_SetError("no displays");
+        SDL3_free(list);
         return -1;
     }
 
@@ -6932,6 +7961,8 @@ Display_IDToIndex(SDL_DisplayID displayID)
             break;
         }
     }
+    SDL3_free(list);
+
     return displayIndex;
 }
 
@@ -7073,49 +8104,35 @@ SDL_GetDesktopDisplayMode(int displayIndex, SDL2_DisplayMode *mode)
 
 #define PROP_WINDOW_FULLSCREEN_MODE "sdl2-compat.window.fullscreen-mode"
 
-static int
-ApplyFullscreenMode(SDL_Window *window)
+static int ApplyFullscreenMode(SDL_Window *window)
 {
-    SDL2_DisplayMode *property = (SDL2_DisplayMode *) SDL3_GetPointerProperty(SDL3_GetWindowProperties(window), PROP_WINDOW_FULLSCREEN_MODE, NULL);
+    /* Always try to enter fullscreen on the current display */
+    const SDL_DisplayID displayID = SDL3_GetDisplayForWindow(window);
+    SDL2_DisplayMode *property = (SDL2_DisplayMode *)SDL3_GetPointerProperty(SDL3_GetWindowProperties(window), PROP_WINDOW_FULLSCREEN_MODE, NULL);
     SDL_DisplayMode mode;
+
     SDL3_zero(mode);
     if (property) {
-        /* Always try to enter fullscreen on the current display */
-        const SDL_DisplayID displayID = SDL3_GetDisplayForWindow(window);
-
-        /* The SDL2 refresh rate is rounded off, and SDL3 checks that the mode parameters match exactly, so try to find the closest matching SDL3 mode. */
-        SDL3_GetClosestFullscreenDisplayMode(displayID, property->w, property->h, (float)property->refresh_rate, false, &mode);
+        mode.w = property->w;
+        mode.h = property->h;
+        mode.refresh_rate = (float)property->refresh_rate;
+    } else {
+        SDL3_GetWindowSize(window, &mode.w, &mode.h);
     }
+
+    /* The SDL2 refresh rate is rounded off, and SDL3 checks that the mode parameters match exactly, so try to find the closest matching SDL3 mode. */
+    SDL3_GetClosestFullscreenDisplayMode(displayID, mode.w, mode.h, mode.refresh_rate, false, &mode);
+
     if (mode.displayID && SDL3_SetWindowFullscreenMode(window, &mode)) {
         return 0;
-    } else {
-        int count = 0;
-        SDL_DisplayMode **list;
-        SDL_DisplayID displayID;
-        int ret;
-
-        displayID = SDL3_GetDisplayForWindow(window);
-        if (!displayID) {
-            displayID = SDL3_GetPrimaryDisplay();
-        }
-
-        /* FIXME: at least set a valid fullscreen mode */
-        list = SDL3_GetFullscreenDisplayModes(displayID, &count);
-        if (list && count) {
-            ret = SDL3_SetWindowFullscreenMode(window, list[0]) ? 0 : -1;
-        } else {
-            /* If no exclusive modes, use the fullscreen desktop mode. */
-            ret = SDL3_SetWindowFullscreenMode(window, NULL) ? 0 : -1;
-        }
-        SDL3_free(list);
-        return ret;
     }
+    return -1;
 }
 
 SDL_DECLSPEC int SDLCALL
 SDL_GetWindowDisplayMode(SDL_Window *window, SDL2_DisplayMode *mode)
 {
-    /* returns a pointer to the fullscreen mode to use or NULL for desktop mode */
+    int display;
     const SDL2_DisplayMode *dp;
 
     if (!window) {
@@ -7132,26 +8149,35 @@ SDL_GetWindowDisplayMode(SDL_Window *window, SDL2_DisplayMode *mode)
     if (dp) {
         SDL3_copyp(mode, dp);
     } else {
-        const SDL_DisplayMode *dp3;
-        SDL_DisplayID displayID = SDL3_GetDisplayForWindow(window);
-        if (!displayID) {
-            displayID = SDL3_GetPrimaryDisplay();
-        }
+        SDL3_zerop(mode);
+    }
 
-        /* Desktop mode */
-        /* FIXME: is this correct ? */
-        dp3 = SDL3_GetDesktopDisplayMode(displayID);
-        if (dp3 == NULL) {
+    if (!mode->w) {
+        SDL3_GetWindowSize(window, &mode->w, NULL);
+    }
+    if (!mode->h) {
+        SDL3_GetWindowSize(window, NULL, &mode->h);
+    }
+
+    display = SDL_GetWindowDisplayIndex(window);
+
+    /* if in desktop size mode, just return the size of the desktop */
+    if ((SDL_GetWindowFlags(window) & SDL2_WINDOW_FULLSCREEN_DESKTOP) == SDL2_WINDOW_FULLSCREEN_DESKTOP) {
+        if (SDL_GetDesktopDisplayMode(display, mode) < 0) {
             return -1;
         }
-        DisplayMode_3to2(dp3, mode);
 
         /* When returning the desktop mode, make sure the refresh is some nonzero value. */
         if (mode->refresh_rate == 0) {
             mode->refresh_rate = 60;
         }
+    } else {
+        if (!SDL_GetClosestDisplayMode(display, mode, mode)) {
+            SDL_zerop(mode);
+            SDL3_SetError("Couldn't find display mode match");
+            return -1;
+        }
     }
-
     return 0;
 }
 
@@ -7207,11 +8233,14 @@ SDL_SetWindowDisplayMode(SDL_Window *window, const SDL2_DisplayMode *mode)
         result = SDL3_SetPointerProperty(SDL3_GetWindowProperties(window), PROP_WINDOW_FULLSCREEN_MODE, NULL) ? 0 : -1;
     }
 
-    /* If're we're in full-screen exclusive mode now, apply the new display mode */
-    if ((SDL3_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) && SDL3_GetWindowFullscreenMode(window)) {
-        result = ApplyFullscreenMode(window);
+    /* If we're in full-screen exclusive mode now, apply the new display mode.
+     * Note SDL2 did not fail if this didn't work.
+     */
+    if (result == 0 &&
+        (SDL3_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) &&
+        SDL3_GetWindowFullscreenMode(window)) {
+        ApplyFullscreenMode(window);
     }
-
     return result;
 }
 
@@ -7560,17 +8589,49 @@ WindowPos2To3(int *x, int *y)
     }
 }
 
+static void StartTextInputForWindow(SDL_Window *window)
+{
+    SDL_PropertiesID props = SDL3_CreateProperties();
+
+    SDL3_SetNumberProperty(props, SDL_PROP_TEXTINPUT_TYPE_NUMBER, SDL_TEXTINPUT_TYPE_TEXT);
+    SDL3_SetNumberProperty(props, SDL_PROP_TEXTINPUT_CAPITALIZATION_NUMBER, SDL_CAPITALIZE_NONE);
+    SDL3_SetBooleanProperty(props, SDL_PROP_TEXTINPUT_AUTOCORRECT_BOOLEAN, false);
+
+    SDL3_StartTextInputWithProperties(window, props);
+
+    SDL3_DestroyProperties(props);
+}
+
+static void FinishWindowCreation(SDL_Window *window)
+{
+    /* SDL3 has per-window text input, so we must enable on this window if it's active */
+    if (SDL_IsTextInputActive()) {
+        StartTextInputForWindow(window);
+    }
+}
+
 SDL_DECLSPEC SDL_Window * SDLCALL
 SDL_CreateWindow(const char *title, int x, int y, int w, int h, Uint32 flags)
 {
     SDL_Window *window = NULL;
     const Uint32 is_popup = flags & (SDL_WINDOW_POPUP_MENU | SDL_WINDOW_TOOLTIP);
+    bool exclusive_fullscreen = false;
+    bool manually_show = false;
 
     CheckEventFilter();
 
-    if (flags & SDL2_WINDOW_FULLSCREEN_DESKTOP) {
+    if ((flags & SDL2_WINDOW_FULLSCREEN_DESKTOP) == SDL2_WINDOW_FULLSCREEN_DESKTOP) {
         flags &= ~SDL2_WINDOW_FULLSCREEN_DESKTOP;
         flags |= SDL_WINDOW_FULLSCREEN; /* This is fullscreen desktop for new windows */
+    } else if (flags & SDL_WINDOW_FULLSCREEN) {
+        /* We'll set the fullscreen mode after window creation */
+        exclusive_fullscreen = true;
+
+        flags &= ~SDL_WINDOW_FULLSCREEN;
+        if (!(flags & SDL_WINDOW_HIDDEN)) {
+            flags |= SDL_WINDOW_HIDDEN;
+            manually_show = true;
+        }
     }
     if (flags & SDL2_WINDOW_SKIP_TASKBAR) {
         flags &= ~SDL2_WINDOW_SKIP_TASKBAR;
@@ -7581,6 +8642,10 @@ SDL_CreateWindow(const char *title, int x, int y, int w, int h, Uint32 flags)
     if (flags & SDL2_WINDOW_ALWAYS_ON_TOP) {
         flags &= ~SDL2_WINDOW_ALWAYS_ON_TOP;
         flags |= SDL_WINDOW_ALWAYS_ON_TOP;
+    }
+
+    if ((flags & SDL_WINDOW_HIGH_PIXEL_DENSITY) && SDL3_GetHintBoolean("SDL_VIDEO_HIGHDPI_DISABLED", false)) {
+        flags &= ~SDL_WINDOW_HIGH_PIXEL_DENSITY;
     }
 
     if (!is_popup) {
@@ -7614,9 +8679,14 @@ SDL_CreateWindow(const char *title, int x, int y, int w, int h, Uint32 flags)
         }
     }
 
-    #if !defined(SDL_PLATFORM_IOS) && !defined(SDL_PLATFORM_ANDROID)  // (and maybe others...?)
-    SDL3_StartTextInput(window);
-    #endif
+    if (exclusive_fullscreen) {
+        ApplyFullscreenMode(window);
+        SDL3_SetWindowFullscreen(window, true);
+    }
+    if (manually_show) {
+        SDL3_ShowWindow(window);
+    }
+    FinishWindowCreation(window);
 
     return window;
 }
@@ -7680,6 +8750,9 @@ SDL_CreateWindowFrom(const void *data)
     SDL3_SetPointerProperty(props, "sdl2-compat.external_window", (void *)data);
     window = SDL3_CreateWindowWithProperties(props);
     SDL3_DestroyProperties(props);
+
+    FinishWindowCreation(window);
+
     return window;
 }
 
@@ -7693,17 +8766,19 @@ SDL_DECLSPEC int SDLCALL
 SDL_SetWindowFullscreen(SDL_Window *window, Uint32 flags)
 {
     int ret = 0;
+    bool fullscreen = false;
 
     if (flags == SDL2_WINDOW_FULLSCREEN_DESKTOP) {
+        fullscreen = true;
         ret = SDL3_SetWindowFullscreenMode(window, NULL) ? 0 : -1;
     } else if (flags == SDL_WINDOW_FULLSCREEN) {
+        fullscreen = true;
         ret = ApplyFullscreenMode(window);
     }
 
     if (ret == 0) {
-        ret = SDL3_SetWindowFullscreen(window, (flags & SDL2_WINDOW_FULLSCREEN_DESKTOP) != 0) ? 0 : -1;
+        ret = SDL3_SetWindowFullscreen(window, fullscreen) ? 0 : -1;
     }
-
     return ret;
 }
 
@@ -7722,6 +8797,9 @@ SDL_SetWindowIcon(SDL_Window *window, SDL2_Surface *icon)
 SDL_DECLSPEC void SDLCALL
 SDL_SetWindowSize(SDL_Window *window, int w, int h)
 {
+    SDL_PropertiesID props = SDL3_GetWindowProperties(window);
+    SDL3_SetNumberProperty(props, PROP_WINDOW_EXPECTED_WIDTH, w);
+    SDL3_SetNumberProperty(props, PROP_WINDOW_EXPECTED_HEIGHT, h);
     SDL3_SetWindowSize(window, w, h);
 }
 
@@ -7791,19 +8869,19 @@ SDL_JoystickSetPlayerIndex(SDL_Joystick *joystick, int player_index)
 SDL_DECLSPEC void SDLCALL
 SDL_StartTextInput(void)
 {
-    SDL_Window **windows = SDL3_GetWindows(NULL);
+    SDL_Window **windows;
+
+    /* First, enable text events */
+    (void)SDL_EventState(SDL_EVENT_TEXT_INPUT, SDL2_ENABLE);
+    (void)SDL_EventState(SDL_EVENT_TEXT_EDITING, SDL2_ENABLE);
+
+    windows = SDL3_GetWindows(NULL);
     if (windows) {
         int i;
-        SDL_PropertiesID props = SDL3_CreateProperties();
-
-        SDL3_SetNumberProperty(props, SDL_PROP_TEXTINPUT_TYPE_NUMBER, SDL_TEXTINPUT_TYPE_TEXT);
-        SDL3_SetNumberProperty(props, SDL_PROP_TEXTINPUT_CAPITALIZATION_NUMBER, SDL_CAPITALIZE_NONE);
-        SDL3_SetBooleanProperty(props, SDL_PROP_TEXTINPUT_AUTOCORRECT_BOOLEAN, false);
 
         for (i = 0; windows[i]; ++i) {
-            SDL3_StartTextInputWithProperties(windows[i], props);
+            StartTextInputForWindow(windows[i]);
         }
-        SDL3_DestroyProperties(props);
 
         SDL3_free(windows);
     }
@@ -7812,20 +8890,7 @@ SDL_StartTextInput(void)
 SDL_DECLSPEC SDL2_bool SDLCALL
 SDL_IsTextInputActive(void)
 {
-    SDL2_bool result = SDL2_FALSE;
-    SDL_Window **windows = SDL3_GetWindows(NULL);
-    if (windows) {
-        int i;
-
-        for (i = 0; windows[i]; ++i) {
-            if (SDL3_TextInputActive(windows[i])) {
-                result = SDL2_TRUE;
-                break;
-            }
-        }
-        SDL3_free(windows);
-    }
-    return result;
+    return SDL3_EventEnabled(SDL_EVENT_TEXT_INPUT) ? SDL2_TRUE : SDL2_FALSE;
 }
 
 SDL_DECLSPEC void SDLCALL
@@ -7840,6 +8905,10 @@ SDL_StopTextInput(void)
         }
         SDL3_free(windows);
     }
+
+    /* Finally disable text events */
+    (void)SDL_EventState(SDL_EVENT_TEXT_INPUT, SDL2_DISABLE);
+    (void)SDL_EventState(SDL_EVENT_TEXT_EDITING, SDL2_DISABLE);
 }
 
 SDL_DECLSPEC void SDLCALL
@@ -8595,34 +9664,46 @@ SDL_GetSurfaceBlendMode(SDL2_Surface *surface, SDL_BlendMode *blendMode)
     return SDL3_GetSurfaceBlendMode(Surface2to3(surface), blendMode) ? 0 : -1;
 }
 
+static void SDLCALL CleanupWindowSurface(void *userdata, void *value)
+{
+    SDL2_Surface *surface = (SDL2_Surface *)value;
+    surface->flags &= ~SDL_DONTFREE;
+    surface->map = NULL;
+    SDL_FreeSurface(surface);
+}
+
 SDL_DECLSPEC SDL2_Surface * SDLCALL
 SDL_GetWindowSurface(SDL_Window *window)
 {
-    SDL2_Surface *surface2 = Surface3to2(SDL3_GetWindowSurface(window));
-    if (surface2) {
-        surface2->flags |= SDL_DONTFREE;
-    }
+    SDL_Surface *surface = SDL3_GetWindowSurface(window);
+    SDL2_Surface *surface2 = NULL;
+    if (surface) {
+        surface2 = (SDL2_Surface *)SDL3_GetPointerProperty(SDL3_GetSurfaceProperties(surface), PROP_SURFACE2, NULL);
+        if (!surface2) {
+            /* See if we can reuse an existing surface */
+            surface2 = (SDL2_Surface *)SDL3_GetPointerProperty(SDL3_GetWindowProperties(window), PROP_SURFACE2, NULL);
+            if (surface2) {
+                /* Link the new window surface to the SDL2 window surface */
+                surface2->map = (SDL_BlitMap *)surface;
+                SDL3_SetPointerProperty(SDL3_GetSurfaceProperties(surface), PROP_SURFACE2, surface2);
 
-    if (surface2) {
-        /* if the window was resized, SDL_GetWindowSurface() will destroy the previous surface and create a new one.
-           This takes the previous SDL2 surface with it. It's not legal to SDL_FreeSurface() a window surface, but
-           in SDL2, it didn't dereference free'd memory to do so, so we need to keep track of old pointers in case
-           an app tries to free them. */
-        int i;
-        const int total = (int) (SDL_arraysize(OldWindowSurfaces));
-        for (i = 0; i < total; i++) {
-            if (OldWindowSurfaces[i] == surface2) {
-                break;
+                surface2->flags = (surface->flags & SHARED_SURFACE_FLAGS) | SDL_DONTFREE;
+                surface2->w = surface->w;
+                surface2->h = surface->h;
+                surface2->pixels = surface->pixels;
+                surface2->pitch = surface->pitch;
+
+                SDL3_GetSurfaceClipRect(surface, &surface2->clip_rect);
+            } else {
+                surface2 = CreateSurface2from3(surface);
+                if (surface2) {
+                    surface2->flags |= SDL_DONTFREE;
+
+                    SDL3_SetPointerPropertyWithCleanup(SDL3_GetWindowProperties(window), PROP_SURFACE2, surface2, CleanupWindowSurface, NULL);
+                }
             }
         }
-
-        /* just keep the last X surfaces; this is a hack to keep buggy legacy code running. */
-        if (i == total) {
-            SDL3_memmove(&OldWindowSurfaces[1], &OldWindowSurfaces[0], sizeof (OldWindowSurfaces) - sizeof (OldWindowSurfaces[0]));
-            OldWindowSurfaces[0] = surface2;
-        }
     }
-
     return surface2;
 }
 
@@ -8656,14 +9737,93 @@ SDL_JoystickGetGUIDString(SDL_GUID guid, char *pszGUID, int cbGUID)
     SDL3_GUIDToString(guid, pszGUID, cbGUID);
 }
 
+#ifdef SDL_PLATFORM_WINDOWS
+static SDL2_WindowsMessageHook g_WindowsMessageHook = NULL;
+static void *g_WindowsMessageHookData = NULL;
+
+static bool SDLCALL SDL3to2_WindowsMessageHook(void *userdata, MSG *msg)
+{
+    if (g_WindowsMessageHook) {
+        g_WindowsMessageHook(g_WindowsMessageHookData, msg->hwnd, msg->message, msg->wParam, msg->lParam);
+    }
+    if (SDL3_EventEnabled(SDL2_SYSWMEVENT)) {
+        SDL2_Event event;
+
+        SDL2_SysWMmsg wmmsg;
+        SDL_GetVersion(&wmmsg.version);
+        wmmsg.subsystem = SDL2_SYSWM_WINDOWS;
+        wmmsg.msg.win.hwnd = msg->hwnd;
+        wmmsg.msg.win.msg = msg->message;
+        wmmsg.msg.win.wParam = msg->wParam;
+        wmmsg.msg.win.lParam = msg->lParam;
+
+        SDL3_zero(event);
+        event.type = SDL2_SYSWMEVENT;
+        event.syswm.msg = &wmmsg;
+        SDL_PushEvent(&event);
+    }
+    return true;
+}
+
+SDL_DECLSPEC void SDLCALL
+SDL_SetWindowsMessageHook(SDL2_WindowsMessageHook callback, void *userdata)
+{
+    SDL_WindowsMessageHook callback3;
+    if (callback || SDL3_EventEnabled(SDL2_SYSWMEVENT)) {
+        callback3 = SDL3to2_WindowsMessageHook;
+    } else {
+        callback3 = NULL;
+    }
+    g_WindowsMessageHook = callback;
+    g_WindowsMessageHookData = userdata;
+    SDL3_SetWindowsMessageHook(callback3, NULL);
+}
+#endif /* SDL_PLATFORM_WINDOWS */
+
+#if defined(SDL_PLATFORM_UNIX) && !defined(SDL_PLATFORM_ANDROID)
+static bool SDLCALL SDL2COMPAT_X11EventHook(void *userdata, XEvent *xevent)
+{
+    SDL2_Event event;
+
+    SDL2_SysWMmsg wmmsg;
+    SDL_GetVersion(&wmmsg.version);
+    wmmsg.subsystem = SDL2_SYSWM_X11;
+    wmmsg.msg.x11.event = *xevent;
+
+    SDL3_zero(event);
+    event.type = SDL2_SYSWMEVENT;
+    event.syswm.msg = &wmmsg;
+    SDL_PushEvent(&event);
+    return true;
+}
+#endif /* SDL_PLATFORM_UNIX */
+
 /* SDL3 split this into getter/setter functions. */
 SDL_DECLSPEC Uint8 SDLCALL
 SDL_EventState(Uint32 type, int state)
 {
     const int retval = SDL3_EventEnabled(type) ? SDL2_ENABLE : SDL2_DISABLE;
     if (state == SDL2_ENABLE) {
+        if (type == SDL2_SYSWMEVENT) {
+#ifdef SDL_PLATFORM_WINDOWS
+            SDL3_SetWindowsMessageHook(SDL3to2_WindowsMessageHook, NULL);
+#endif
+#if defined(SDL_PLATFORM_UNIX) && !defined(SDL_PLATFORM_ANDROID)
+            SDL3_SetX11EventHook(SDL2COMPAT_X11EventHook, NULL);
+#endif
+        }
         SDL3_SetEventEnabled(type, true);
     } else if (state == SDL2_DISABLE) {
+        if (type == SDL2_SYSWMEVENT) {
+#ifdef SDL_PLATFORM_WINDOWS
+            if (!g_WindowsMessageHook) {
+                SDL_SetWindowsMessageHook(NULL, NULL);
+            }
+#endif
+#if defined(SDL_PLATFORM_UNIX) && !defined(SDL_PLATFORM_ANDROID)
+            SDL3_SetX11EventHook(NULL, NULL);
+#endif
+        }
         SDL3_SetEventEnabled(type, false);
     }
     return retval;
@@ -8715,8 +9875,46 @@ SDL_JoystickEventState(int state)
 
 /* SDL3 dumped the index/instance difference for various devices. */
 
-static SDL_JoystickID
-GetJoystickInstanceFromIndex(int idx)
+static void AddJoystickID(SDL_JoystickID id)
+{
+    int i;
+    SDL_JoystickID *new_instance_list;
+
+    for (i = 0; i < num_joystick_instances; ++i) {
+        if (id == joystick_instance_list[i]) {
+            return;
+        }
+    }
+
+    /* Need to add this joystick to the instance list */
+    new_instance_list = (SDL_JoystickID *)SDL_realloc(joystick_instance_list, (num_joystick_instances + 1) * sizeof(*new_instance_list));
+    if (new_instance_list) {
+        joystick_instance_list = new_instance_list;
+        joystick_instance_list[num_joystick_instances++] = id;
+    }
+}
+
+static SDL_JoystickID JoystickID2to3(SDL2_JoystickID id)
+{
+    if (id >= 0 && id < num_joystick_instances) {
+        return joystick_instance_list[id];
+    }
+    return 0;
+}
+
+static SDL2_JoystickID JoystickID3to2(SDL_JoystickID id)
+{
+    SDL2_JoystickID i;
+
+    for (i = 0; i < num_joystick_instances; ++i) {
+        if (joystick_instance_list[i] == id) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static SDL_JoystickID GetJoystickInstanceFromIndex(int idx)
 {
     if ((idx < 0) || (idx >= num_joysticks)) {
         SDL3_SetError("There are %d joysticks available", num_joysticks);
@@ -8730,17 +9928,21 @@ GetJoystickInstanceFromIndex(int idx)
 SDL_DECLSPEC int SDLCALL
 SDL_NumJoysticks(void)
 {
+    int i;
     SDL3_free(joystick_list);
     joystick_list = SDL3_GetJoysticks(&num_joysticks);
     if (joystick_list == NULL) {
         num_joysticks = 0;
         return -1;
     }
+    for (i = 0; i < num_joysticks; ++i) {
+        AddJoystickID(joystick_list[i]);
+    }
     return num_joysticks;
 }
 
-static int
-GetIndexFromJoystickInstance(SDL_JoystickID jid) {
+static int GetIndexFromJoystickInstance(SDL_JoystickID jid)
+{
     if (jid != 0) {
         int i;
         for (i = 0; i < num_joysticks; i++) {
@@ -8816,7 +10018,7 @@ SDL_JoystickGetDeviceInstanceID(int idx)
     if (!jid) {
         return -1;
     }
-    return (SDL2_JoystickID)jid;
+    return JoystickID3to2(jid);
 }
 
 SDL_DECLSPEC Uint8 SDLCALL
@@ -8832,19 +10034,19 @@ SDL_JoystickInstanceID(SDL_Joystick *joystick)
     if (!jid) {
         return -1;
     }
-    return (SDL2_JoystickID)jid;
+    return JoystickID3to2(jid);
 }
 
 SDL_DECLSPEC SDL_Joystick* SDLCALL
 SDL_JoystickFromInstanceID(SDL2_JoystickID jid)
 {
-    return SDL3_GetJoystickFromID((SDL_JoystickID)jid);
+    return SDL3_GetJoystickFromID(JoystickID2to3(jid));
 }
 
 SDL_DECLSPEC SDL_GameController* SDLCALL
 SDL_GameControllerFromInstanceID(SDL2_JoystickID jid)
 {
-    return SDL3_GetGamepadFromID((SDL_JoystickID)jid);
+    return SDL3_GetGamepadFromID(JoystickID2to3(jid));
 }
 
 SDL_DECLSPEC int SDLCALL
@@ -9268,8 +10470,46 @@ SDL_JoystickDetachVirtual(int device_index)
 }
 
 
-static SDL_SensorID
-GetSensorInstanceFromIndex(int idx)
+static void AddSensorID(SDL_SensorID id)
+{
+    int i;
+    SDL_SensorID *new_instance_list;
+
+    for (i = 0; i < num_sensor_instances; ++i) {
+        if (id == sensor_instance_list[i]) {
+            return;
+        }
+    }
+
+    /* Need to add this sensor to the instance list */
+    new_instance_list = (SDL_SensorID *)SDL_realloc(sensor_instance_list, (num_sensor_instances + 1) * sizeof(*new_instance_list));
+    if (new_instance_list) {
+        sensor_instance_list = new_instance_list;
+        sensor_instance_list[num_sensor_instances++] = id;
+    }
+}
+
+static SDL_SensorID SensorID2to3(SDL2_SensorID id)
+{
+    if (id >= 0 && id < num_sensor_instances) {
+        return sensor_instance_list[id];
+    }
+    return 0;
+}
+
+static SDL2_SensorID SensorID3to2(SDL_SensorID id)
+{
+    SDL2_SensorID i;
+
+    for (i = 0; i < num_sensor_instances; ++i) {
+        if (sensor_instance_list[i] == id) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static SDL_SensorID GetSensorInstanceFromIndex(int idx)
 {
     if ((idx < 0) || (idx >= num_sensors)) {
         SDL3_SetError("There are %d sensors available", num_sensors);
@@ -9281,11 +10521,16 @@ GetSensorInstanceFromIndex(int idx)
 SDL_DECLSPEC int SDLCALL
 SDL_NumSensors(void)
 {
+    int i;
+
     SDL3_free(sensor_list);
     sensor_list = SDL3_GetSensors(&num_sensors);
     if (sensor_list == NULL) {
         num_sensors = 0;
         return -1;
+    }
+    for (i = 0; i < num_sensors; ++i) {
+        AddSensorID(sensor_list[i]);
     }
     return num_sensors;
 }
@@ -9319,7 +10564,7 @@ SDL_SensorGetDeviceInstanceID(int idx)
     if (!sid) {
         return -1;
     }
-    return (SDL2_SensorID)sid;
+    return SensorID3to2(sid);
 }
 
 SDL_DECLSPEC SDL2_SensorID SDLCALL
@@ -9329,13 +10574,13 @@ SDL_SensorGetInstanceID(SDL_Sensor *sensor)
     if (!sid) {
         return -1;
     }
-    return (SDL2_SensorID)sid;
+    return SensorID3to2(sid);
 }
 
 SDL_DECLSPEC SDL_Sensor* SDLCALL
 SDL_SensorFromInstanceID(SDL2_SensorID sid)
 {
-    return SDL3_GetSensorFromID((SDL_SensorID)sid);
+    return SDL3_GetSensorFromID(SensorID2to3(sid));
 }
 
 SDL_DECLSPEC SDL_Sensor* SDLCALL
@@ -9375,8 +10620,7 @@ SDL_HapticName(int device_index)
     return instance_id ? SDL3_GetHapticNameForID(instance_id) : NULL;
 }
 
-SDL_DECLSPEC
-SDL_Haptic * SDLCALL
+SDL_DECLSPEC SDL_Haptic * SDLCALL
 SDL_HapticOpen(int device_index)
 {
     const SDL_HapticID instance_id = GetHapticInstanceFromIndex(device_index);
@@ -9689,7 +10933,6 @@ SDL_SIMDRealloc(void *mem, const size_t len)
     }
 
     ptr = (Uint8 *)SDL3_realloc(mem, to_allocate);
-
     if (ptr == NULL) {
         return NULL; /* Out of memory, bail! */
     }
@@ -9703,7 +10946,6 @@ SDL_SIMDRealloc(void *mem, const size_t len)
         ptrdiff = ((size_t)retval) - ((size_t)ptr);
         if (memdiff != ptrdiff) { /* Delta has changed, copy to new offset! */
             oldmem = (void *)(((uintptr_t)ptr) + memdiff);
-
             /* Even though the data past the old `len` is undefined, this is the
              * only length value we have, and it guarantees that we copy all the
              * previous memory anyhow.
@@ -9755,7 +10997,7 @@ static bool SDL_IsSupportedChannelCount(const int channels)
 
 
 typedef struct {
-    SDL2_AudioFormat src_format;
+    /* src_format is read directly from the AudioCVT in real SDL2 */
     Uint8 src_channels;
     int src_rate;
     SDL2_AudioFormat dst_format;
@@ -9766,6 +11008,64 @@ typedef struct {
 #define RESAMPLER_BITS_PER_SAMPLE           16
 #define RESAMPLER_SAMPLES_PER_ZERO_CROSSING (1 << ((RESAMPLER_BITS_PER_SAMPLE / 2) + 1))
 
+static void SDLCALL AudioCVTFilter(SDL_AudioCVT *cvt, SDL2_AudioFormat src_format)
+{
+    SDL2_AudioStream *stream2;
+    SDL2_AudioFormat dst_format;
+    int src_channels, src_rate;
+    int dst_channels, dst_rate;
+    int src_len, dst_len, real_dst_len;
+    int src_samplesize;
+
+    { /* Fetch from the end of filters[], aligned */
+        AudioParam ap;
+
+        SDL3_memcpy(
+            &ap,
+            (Uint8 *)&cvt->filters[SDL_AUDIOCVT_MAX_FILTERS + 1] - (sizeof(AudioParam) & ~3),
+            sizeof(ap));
+
+        src_channels = ap.src_channels;
+        src_rate = ap.src_rate;
+        dst_format = ap.dst_format;
+        dst_channels = ap.dst_channels;
+        dst_rate = ap.dst_rate;
+    }
+
+    /* don't use the SDL3 stream directly or even SDL_ConvertAudioSamples; we want the U16 support in the sdl2-compat layer */
+    stream2 = SDL_NewAudioStream(src_format, src_channels, src_rate,
+                                 dst_format, dst_channels, dst_rate);
+    if (stream2 == NULL) {
+        goto exit;
+    }
+
+    src_samplesize = (SDL_AUDIO_BITSIZE(src_format) / 8) * src_channels;
+
+    src_len = cvt->len_cvt & ~(src_samplesize - 1);
+    dst_len = cvt->len * cvt->len_mult;
+
+    /* Run the audio converter */
+    if (SDL_AudioStreamPut(stream2, cvt->buf, src_len) < 0 ||
+        SDL_AudioStreamFlush(stream2) < 0) {
+        goto exit;
+    }
+
+    /* Get back in the same buffer */
+    real_dst_len = SDL_AudioStreamGet(stream2, cvt->buf, dst_len);
+    if (real_dst_len < 0) {
+        goto exit;
+    }
+
+    cvt->len_cvt = real_dst_len;
+
+exit:
+    SDL_FreeAudioStream(stream2);
+
+    /* Call the next filter in the chain */
+    if (cvt->filters[++cvt->filter_index]) {
+        cvt->filters[cvt->filter_index](cvt, dst_format);
+    }
+}
 
 SDL_DECLSPEC int SDLCALL
 SDL_BuildAudioCVT(SDL_AudioCVT *cvt,
@@ -9835,7 +11135,6 @@ SDL_BuildAudioCVT(SDL_AudioCVT *cvt,
 
     { /* Use the filters[] to store some data ... */
         AudioParam ap;
-        ap.src_format = src_format;
         ap.src_channels = src_channels;
         ap.src_rate = src_rate;
         ap.dst_format = dst_format;
@@ -9848,7 +11147,6 @@ SDL_BuildAudioCVT(SDL_AudioCVT *cvt,
             &ap,
             sizeof(ap));
 
-        cvt->filters[0] = NULL;
         cvt->needed = 1;
         if (src_format == dst_format && src_rate == dst_rate && src_channels == dst_channels) {
             cvt->needed = 0;
@@ -9882,93 +11180,54 @@ SDL_BuildAudioCVT(SDL_AudioCVT *cvt,
         }
     }
 
+    if (cvt->needed) {
+        /* Insert a single filter to perform all necessary audio conversion.
+         * Some apps may examine or modify the filter chain, so we use a real
+         * SDL2-style audio filter function to keep those apps happy. */
+        cvt->filters[0] = AudioCVTFilter;
+        cvt->filters[1] = NULL;
+        cvt->filter_index = 1;
+    }
+
     return cvt->needed;
 }
 
 SDL_DECLSPEC int SDLCALL
 SDL_ConvertAudio(SDL_AudioCVT *cvt)
 {
-    SDL2_AudioStream *stream2;
-    SDL2_AudioFormat src_format, dst_format;
-    int src_channels, src_rate;
-    int dst_channels, dst_rate;
-
-    int src_len, dst_len, real_dst_len;
-    int src_samplesize;
-
-    /* Sanity check target pointer */
-    if (cvt == NULL) {
-        SDL3_InvalidParamError("cvt");
-        return -1;
+    /* Make sure there's data to convert */
+    if (!cvt->buf) {
+        return SDL_SetError("No buffer allocated for conversion");
     }
 
-    { /* Fetch from the end of filters[], aligned */
-        AudioParam ap;
-
-        SDL3_memcpy(
-            &ap,
-            (Uint8 *)&cvt->filters[SDL_AUDIOCVT_MAX_FILTERS + 1] - (sizeof(AudioParam) & ~3),
-            sizeof(ap));
-
-        src_format = ap.src_format;
-        src_channels = ap.src_channels;
-        src_rate = ap.src_rate;
-        dst_format = ap.dst_format;
-        dst_channels = ap.dst_channels;
-        dst_rate = ap.dst_rate;
+    /* Return okay if no conversion is necessary */
+    cvt->len_cvt = cvt->len;
+    if (cvt->filters[0] == NULL) {
+        return 0;
     }
 
-    /* don't use the SDL3 stream directly or even SDL_ConvertAudioSamples; we want the U16 support in the sdl2-compat layer */
-    stream2 = SDL_NewAudioStream(src_format, src_channels, src_rate,
-                                 dst_format, dst_channels, dst_rate);
-    if (stream2 == NULL) {
-        goto failure;
-    }
-
-    src_samplesize = (SDL_AUDIO_BITSIZE(src_format) / 8) * src_channels;
-
-    src_len = cvt->len & ~(src_samplesize - 1);
-    dst_len = cvt->len * cvt->len_mult;
-
-    /* Run the audio converter */
-    if (SDL_AudioStreamPut(stream2, cvt->buf, src_len) < 0 ||
-        SDL_AudioStreamFlush(stream2) < 0) {
-        goto failure;
-    }
-
-    /* Get back in the same buffer */
-    real_dst_len = SDL_AudioStreamGet(stream2, cvt->buf, dst_len);
-    if (real_dst_len < 0) {
-        goto failure;
-    }
-
-    cvt->len_cvt = real_dst_len;
-
-    SDL_FreeAudioStream(stream2);
-
+    /* Set up the conversion and go! */
+    cvt->filter_index = 0;
+    cvt->filters[0](cvt, cvt->src_format);
     return 0;
-
-failure:
-    SDL_FreeAudioStream(stream2);
-    return -1;
 }
 
 SDL_DECLSPEC void SDLCALL
 SDL_GL_GetDrawableSize(SDL_Window *window, int *w, int *h)
 {
-    SDL_GetWindowSizeInPixels(window, w, h);
+    SDL3_GetWindowSizeInPixels(window, w, h);
 }
 
 SDL_DECLSPEC void SDLCALL
 SDL_Vulkan_GetDrawableSize(SDL_Window *window, int *w, int *h)
 {
-    SDL_GetWindowSizeInPixels(window, w, h);
+    SDL3_GetWindowSizeInPixels(window, w, h);
 }
 
 SDL_DECLSPEC void SDLCALL
 SDL_Metal_GetDrawableSize(SDL_Window *window, int *w, int *h)
 {
-    SDL_GetWindowSizeInPixels(window, w, h);
+    SDL3_GetWindowSizeInPixels(window, w, h);
 }
 
 SDL_DECLSPEC char * SDLCALL
@@ -10236,24 +11495,6 @@ SDL_UnloadObject(void *lib)
     SDL3_UnloadObject((SDL_SharedObject *) lib);
 }
 
-
-#if defined(SDL_PLATFORM_WIN32) || defined(SDL_PLATFORM_GDK)
-static SDL2_WindowsMessageHook g_WindowsMessageHook = NULL;
-
-static bool SDLCALL SDL3to2_WindowsMessageHook(void *userdata, MSG *msg)
-{
-    g_WindowsMessageHook(userdata, msg->hwnd, msg->message, msg->wParam, msg->lParam);
-    return true;
-}
-
-SDL_DECLSPEC void SDLCALL
-SDL_SetWindowsMessageHook(SDL2_WindowsMessageHook callback, void *userdata)
-{
-    SDL_WindowsMessageHook callback3 = (callback != NULL) ? SDL3to2_WindowsMessageHook : NULL;
-    g_WindowsMessageHook = callback;
-    SDL3_SetWindowsMessageHook(callback3, userdata);
-}
-#endif
 
 #if defined(SDL_PLATFORM_WIN32) || defined(SDL_PLATFORM_WINGDK)
 SDL_DECLSPEC int SDLCALL
