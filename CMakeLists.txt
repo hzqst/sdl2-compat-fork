@@ -5,6 +5,12 @@
 cmake_minimum_required(VERSION 3.0...3.28)
 project(sdl2_compat VERSION 2.32.57 LANGUAGES C)
 
+option(USE_VCLTL "USE VCLTL" OFF)
+
+if(USE_VCLTL)
+include("VC-LTL helper for cmake.cmake")
+endif()
+
 if(POLICY CMP0074)
   # CMP0074: find_package() uses <PackageName>_ROOT variables.
   cmake_policy(SET CMP0074 NEW)
