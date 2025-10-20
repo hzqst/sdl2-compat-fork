@@ -220,7 +220,10 @@
 #define SDL_LOADSO_DLOPEN 1
 #define SDL_THREAD_PTHREAD 1
 #define SDL_TIMER_UNIX 1
+/* Allow building without X11 support */
+#ifndef SDL2COMPAT_DISABLE_X11
 #define SDL_VIDEO_DRIVER_X11 1
+#endif
 
 #if defined(__LINUX__)
 /* glvis wants this */

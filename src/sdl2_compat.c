@@ -111,14 +111,6 @@ This breaks the build when creating SDL_ ## DisableScreenSaver
 #define SDL2COMPAT_MAXPATH 1024
 #endif
 
-#if defined(SDL_PLATFORM_UNIX) && !defined(SDL_PLATFORM_ANDROID)
-/* We don't know whether SDL3 was really compiled with X11 support on this
- * platform, but probably it was */
-#define SDL2COMPAT_HAVE_X11
-#else
-#undef SDL2COMPAT_HAVE_X11
-#endif
-
 /* SDL2 function prototypes:  */
 #include "sdl2_protos.h"
 
@@ -361,7 +353,10 @@ static const char *SDL2Compat_GetEnvAtStartup(const char *name)
 static bool SDL2Compat_CheckDebugLogging(void)
 {
     const char *value = SDL2Compat_GetEnvAtStartup("SDL2COMPAT_DEBUG_LOGGING");
-    return (value != NULL) && SDL2Compat_strequal(value, "1");
+    if (!value) {
+        value = SDL2Compat_GetEnvAtStartup("DEBUG_INVOCATION");
+    }
+    return value && SDL2Compat_strequal(value, "1");
 }
 
 
@@ -529,6 +524,12 @@ static QuirkEntryType quirks[] = {
     { "IcewindDale", SDL_HINT_VIDEO_DRIVER, "x11" },
     { "Torment64", SDL_HINT_VIDEO_DRIVER, "x11" },
 
+    /* HOMM3 mouse moves are sluggish without that */
+    {"heroes3.dynamic", SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE, "1"},
+
+    /* Heavy Gear II assumes X11 and segfault otherwise */
+    {"hg2stub", SDL_HINT_VIDEO_DRIVER, "x11"},
+
     /* SimCity 3000 tries to call SDL_DestroyMutex after we have been unloaded */
     {"sc3u.dynamic", "SDL2COMPAT_NO_UNLOAD", "1"},
 #endif
@@ -653,6 +654,7 @@ static struct {
     { "SDL_LINUX_HAT_DEADZONES", "SDL_JOYSTICK_LINUX_HAT_DEADZONES" },
     { "SDL_LINUX_JOYSTICK_CLASSIC", "SDL_JOYSTICK_LINUX_CLASSIC" },
     { "SDL_LINUX_JOYSTICK_DEADZONES", "SDL_JOYSTICK_LINUX_DEADZONES" },
+    { "SDL_MOUSE_RELATIVE_MODE_WARP", "SDL_MOUSE_RELATIVE_SYSTEM_SCALE" },
     { "SDL_PS2_DYNAMIC_VSYNC", "SDL_RENDER_PS2_DYNAMIC_VSYNC" },
     { "SDL_VIDEODRIVER", "SDL_VIDEO_DRIVER" },
     { "SDL_VIDEO_WAYLAND_EMULATE_MOUSE_WARP", "SDL_MOUSE_EMULATE_WARP_WITH_RELATIVE" },
@@ -3577,7 +3579,7 @@ SDL_RWFromFile(const char *file, const char *mode)
 SDL_DECLSPEC SDL2_RWops *SDLCALL
 SDL_RWFromMem(void *mem, int size)
 {
-    if (size < 0) { /* SDL3 already checks size == 0 */
+    if (size <= 0) {
         SDL3_InvalidParamError("size");
         return NULL;
     }
@@ -3587,7 +3589,7 @@ SDL_RWFromMem(void *mem, int size)
 SDL_DECLSPEC SDL2_RWops *SDLCALL
 SDL_RWFromConstMem(const void *mem, int size)
 {
-    if (size < 0) { /* SDL3 already checks size == 0 */
+    if (size <= 0) {
         SDL3_InvalidParamError("size");
         return NULL;
     }

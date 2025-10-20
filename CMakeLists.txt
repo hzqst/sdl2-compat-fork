@@ -93,6 +93,7 @@ cmake_dependent_option(SDL2COMPAT_INSTALL_SDL3 "Install SDL3 next to SDL2" OFF "
 option(SDL2COMPAT_ASAN "Use AddressSanitizer to detect memory errors" OFF)
 option(SDL2COMPAT_STATIC "Enable building static SDL2 link library" OFF)
 option(SDL2COMPAT_WERROR "Treat warnings as errors" OFF)
+option(SDL2COMPAT_DISABLE_X11 "Disable X11 support" OFF)
 set(SDL2COMPAT_VENDOR_INFO "" CACHE STRING "Vendor name and/or version to add to SDL_REVISION")
 set(SDL2COMPAT_FRAMEWORK FALSE)
 #FIXME: should SDL2-compat modify vendor_info/revision information?
@@ -189,7 +190,8 @@ endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/REVISION.txt")
   file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/REVISION.txt" REVISION_txt_lines)
-  list(GET REVISION_txt_lines 0 SDL_REVISION)
+  list(GET REVISION_txt_lines 0 line0)
+  set(SDL_REVISION "SDL-${line0}")
 else()
   find_package(Git)
   if(Git_FOUND)
@@ -228,11 +230,6 @@ set(SDL2COMPAT_SRCS
   src/sdl2_compat.c
   src/dynapi/SDL_dynapi.c
 )
-
-if(UNIX AND NOT ANDROID)
-  find_package(X11 REQUIRED)
-  include_directories(${X11_INCLUDE_DIR})
-endif()
 
 if(APPLE)
   list(APPEND SDL2COMPAT_SRCS
@@ -335,7 +332,16 @@ string(STRIP "${CMAKE_C_FLAGS}" CMAKE_C_FLAGS)
 if(UNIX AND NOT APPLE)
   target_compile_definitions(SDL2 PRIVATE "_REENTRANT")
   target_link_libraries(SDL2 PRIVATE ${CMAKE_DL_LIBS})
+  if(NOT SDL2COMPAT_DISABLE_X11)
+    find_package(X11 REQUIRED)
+    target_compile_definitions(SDL2 PRIVATE SDL2COMPAT_HAVE_X11)
+    include_directories(${X11_INCLUDE_DIR})
+  else()
+    target_compile_definitions(SDL2 PRIVATE SDL2COMPAT_DISABLE_X11)
+    message(STATUS "X11 support disabled")
+  endif()
 endif()
+
 if(ANDROID)
   target_link_libraries(SDL2 PRIVATE log)
 endif()

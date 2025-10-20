@@ -1272,7 +1272,7 @@
 #define SDL_GetDefaultTextureScaleMode IGNORE_THIS_VERSION_OF_SDL_GetDefaultTextureScaleMode
 #define SDL_CreateGPURenderState IGNORE_THIS_VERSION_OF_SDL_CreateGPURenderState
 #define SDL_SetGPURenderStateFragmentUniforms IGNORE_THIS_VERSION_OF_SDL_SetGPURenderStateFragmentUniforms
-#define SDL_SetRenderGPUState IGNORE_THIS_VERSION_OF_SDL_SetRenderGPUState
+#define SDL_SetGPURenderState IGNORE_THIS_VERSION_OF_SDL_SetGPURenderState
 #define SDL_DestroyGPURenderState IGNORE_THIS_VERSION_OF_SDL_DestroyGPURenderState
 #define SDL_SetWindowProgressState IGNORE_THIS_VERSION_OF_SDL_SetWindowProgressState
 #define SDL_SetWindowProgressValue IGNORE_THIS_VERSION_OF_SDL_SetWindowProgressValue
@@ -1289,6 +1289,17 @@
 #define SDL_hid_get_properties IGNORE_THIS_VERSION_OF_SDL_hid_get_properties
 #define SDL_GetPixelFormatFromGPUTextureFormat IGNORE_THIS_VERSION_OF_SDL_GetPixelFormatFromGPUTextureFormat
 #define SDL_GetGPUTextureFormatFromPixelFormat IGNORE_THIS_VERSION_OF_SDL_GetGPUTextureFormatFromPixelFormat
+#define JNI_OnLoad IGNORE_THIS_VERSION_OF_JNI_OnLoad
+#define SDL_SetTexturePalette IGNORE_THIS_VERSION_OF_SDL_SetTexturePalette
+#define SDL_GetTexturePalette IGNORE_THIS_VERSION_OF_SDL_GetTexturePalette
+#define SDL_GetGPURendererDevice IGNORE_THIS_VERSION_OF_SDL_GetGPURendererDevice
+#define SDL_LoadPNG_IO IGNORE_THIS_VERSION_OF_SDL_LoadPNG_IO
+#define SDL_LoadPNG IGNORE_THIS_VERSION_OF_SDL_LoadPNG
+#define SDL_SavePNG_IO IGNORE_THIS_VERSION_OF_SDL_SavePNG_IO
+#define SDL_SavePNG IGNORE_THIS_VERSION_OF_SDL_SavePNG
+#define SDL_GetSystemPageSize IGNORE_THIS_VERSION_OF_SDL_GetSystemPageSize
+#define SDL_GetPenDeviceType IGNORE_THIS_VERSION_OF_SDL_GetPenDeviceType
+#define SDL_CreateAnimatedCursor IGNORE_THIS_VERSION_OF_SDL_CreateAnimatedCursor
 
 
 #define SDL_FUNCTION_POINTER_IS_VOID_POINTER 1
@@ -6271,8 +6282,8 @@
 #undef SDL_SetGPURenderStateFragmentUniforms
 #endif
 
-#ifdef SDL_SetRenderGPUState
-#undef SDL_SetRenderGPUState
+#ifdef SDL_SetGPURenderState
+#undef SDL_SetGPURenderState
 #endif
 
 #ifdef SDL_DestroyGPURenderState
@@ -6339,7 +6350,52 @@
 #undef SDL_GetGPUTextureFormatFromPixelFormat
 #endif
 
-#undef SDL_ThreadID /* see at top. */
+#ifdef JNI_OnLoad
+#undef JNI_OnLoad
+#endif
+
+#ifdef SDL_SetTexturePalette
+#undef SDL_SetTexturePalette
+#endif
+
+#ifdef SDL_GetTexturePalette
+#undef SDL_GetTexturePalette
+#endif
+
+#ifdef SDL_GetGPURendererDevice
+#undef SDL_GetGPURendererDevice
+#endif
+
+#ifdef SDL_LoadPNG_IO
+#undef SDL_LoadPNG_IO
+#endif
+
+#ifdef SDL_LoadPNG
+#undef SDL_LoadPNG
+#endif
+
+#ifdef SDL_SavePNG_IO
+#undef SDL_SavePNG_IO
+#endif
+
+#ifdef SDL_SavePNG
+#undef SDL_SavePNG
+#endif
+
+#ifdef SDL_GetSystemPageSize
+#undef SDL_GetSystemPageSize
+#endif
+
+#ifdef SDL_GetPenDeviceType
+#undef SDL_GetPenDeviceType
+#endif
+
+#ifdef SDL_CreateAnimatedCursor
+#undef SDL_CreateAnimatedCursor
+#endif
+
+/*	see at top.	*/
+#undef SDL_ThreadID
 #ifdef SDL_CreateThread
 #undef SDL_CreateThread
 #endif
@@ -6430,3 +6486,4 @@
 #endif
 
 #endif /* INCL_SDL3_INCLUDE_WRAPPER_H */
+
