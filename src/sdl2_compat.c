@@ -2758,7 +2758,7 @@ EventFilter3to2(void *userdata, SDL_Event *event3)
         case SDL_EVENT_WINDOW_HDR_STATE_CHANGED:
         case SDL_EVENT_KEYBOARD_ADDED: /* Overlaps with SDL_TEXTEDITING_EXT */
         case SDL_EVENT_KEYBOARD_REMOVED:
-        case SDL_EVENT_TEXT_EDITING_CANDIDATES:
+        //case SDL_EVENT_TEXT_EDITING_CANDIDATES: //We need this
         case SDL_EVENT_MOUSE_ADDED:
         case SDL_EVENT_MOUSE_REMOVED:
         case SDL_EVENT_FINGER_CANCELED:
