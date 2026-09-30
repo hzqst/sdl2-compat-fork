@@ -174,6 +174,68 @@ int events_addDelEventWatchWithUserdata(void *arg)
     return TEST_COMPLETED;
 }
 
+static int SDLCALL events_captureWheelEvent(void *userdata, SDL_Event *event)
+{
+    if (event->type == SDL_MOUSEWHEEL) {
+        *(SDL_Event *)userdata = *event;
+    }
+    return 1;
+}
+
+/**
+ * @brief Preserve integer wheel ticks through a push/filter/queue roundtrip.
+ */
+static int events_pushMouseWheel(void *arg)
+{
+    static const int deltas[][2] = { { 1, 0 }, { -2, 0 }, { 0, 1 }, { 0, -3 }, { 4, -5 }, { 0, 0 } };
+    SDL_Event sent, received, filtered;
+    SDL_EventFilter previousFilter = NULL;
+    void *previousUserdata = NULL;
+    int i, result;
+
+    SDL_GetEventFilter(&previousFilter, &previousUserdata);
+    SDL_SetEventFilter(events_captureWheelEvent, &filtered);
+    SDL_FlushEvent(SDL_MOUSEWHEEL);
+
+    for (i = 0; i < SDL_arraysize(deltas); ++i) {
+        /* Unused padding must not become integer ticks during conversion. */
+        SDL_memset(&sent, 0xa5, sizeof(sent));
+        sent.type = SDL_MOUSEWHEEL;
+        sent.wheel.timestamp = 0;
+        sent.wheel.windowID = 0;
+        sent.wheel.which = 0;
+        sent.wheel.x = deltas[i][0];
+        sent.wheel.y = deltas[i][1];
+        sent.wheel.preciseX = (float)sent.wheel.x;
+        sent.wheel.preciseY = (float)sent.wheel.y;
+        sent.wheel.direction = (i % 2) ? SDL_MOUSEWHEEL_FLIPPED : SDL_MOUSEWHEEL_NORMAL;
+        sent.wheel.mouseX = 0;
+        sent.wheel.mouseY = 0;
+        SDL_zero(filtered);
+        SDL_zero(received);
+
+        result = SDL_PushEvent(&sent);
+        SDLTest_AssertCheck(result == 1, "Push wheel event, expected: 1, got: %d", result);
+        SDLTest_AssertCheck(filtered.type == SDL_MOUSEWHEEL, "Filter received wheel event");
+        SDLTest_AssertCheck(filtered.wheel.x == sent.wheel.x && filtered.wheel.y == sent.wheel.y,
+                            "Filter integer ticks, expected: (%d, %d), got: (%d, %d)",
+                            sent.wheel.x, sent.wheel.y, filtered.wheel.x, filtered.wheel.y);
+        result = SDL_PeepEvents(&received, 1, SDL_GETEVENT, SDL_MOUSEWHEEL, SDL_MOUSEWHEEL);
+        SDLTest_AssertCheck(result == 1, "Read wheel event, expected: 1, got: %d", result);
+        SDLTest_AssertCheck(received.wheel.x == sent.wheel.x && received.wheel.y == sent.wheel.y,
+                            "Queue integer ticks, expected: (%d, %d), got: (%d, %d)",
+                            sent.wheel.x, sent.wheel.y, received.wheel.x, received.wheel.y);
+        SDLTest_AssertCheck(received.wheel.direction == sent.wheel.direction,
+                            "Preserve wheel direction, expected: %u, got: %u", sent.wheel.direction, received.wheel.direction);
+        SDLTest_AssertCheck(received.wheel.preciseX == sent.wheel.preciseX && received.wheel.preciseY == sent.wheel.preciseY,
+                            "Preserve precise ticks, expected: (%g, %g), got: (%g, %g)",
+                            sent.wheel.preciseX, sent.wheel.preciseY, received.wheel.preciseX, received.wheel.preciseY);
+    }
+
+    SDL_SetEventFilter(previousFilter, previousUserdata);
+    return TEST_COMPLETED;
+}
+
 /* ================= Test References ================== */
 
 /* Events test cases */
@@ -189,9 +251,13 @@ static const SDLTest_TestCaseReference eventsTest3 = {
     (SDLTest_TestCaseFp)events_addDelEventWatchWithUserdata, "events_addDelEventWatchWithUserdata", "Adds and deletes an event watch function with userdata", TEST_ENABLED
 };
 
+static const SDLTest_TestCaseReference eventsTest4 = {
+    (SDLTest_TestCaseFp)events_pushMouseWheel, "events_pushMouseWheel", "Preserves injected wheel ticks in filters and the queue", TEST_ENABLED
+};
+
 /* Sequence of Events test cases */
 static const SDLTest_TestCaseReference *eventsTests[] = {
-    &eventsTest1, &eventsTest2, &eventsTest3, NULL
+    &eventsTest1, &eventsTest2, &eventsTest3, &eventsTest4, NULL
 };
 
 /* Events test suite (global) */

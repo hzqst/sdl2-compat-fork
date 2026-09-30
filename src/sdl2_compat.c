@@ -2511,6 +2511,8 @@ static SDL_Event *Event2to3(const SDL2_Event *event2, SDL_Event *event3)
         */
         event3->wheel.x = (float)event2->wheel.x;
         event3->wheel.y = (float)event2->wheel.y;
+        event3->wheel.integer_x = event2->wheel.x;
+        event3->wheel.integer_y = event2->wheel.y;
         event3->wheel.mouse_x = (float)event2->wheel.mouseX;
         event3->wheel.mouse_y = (float)event2->wheel.mouseY;
         break;
